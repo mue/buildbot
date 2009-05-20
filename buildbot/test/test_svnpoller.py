@@ -304,9 +304,11 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(len(changes), 2)
         self.failUnlessEqual(changes[0].branch, "branch")
         self.failUnlessEqual(changes[0].revision, '2')
+	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
         self.failUnlessEqual(changes[1].branch, "branch")
         self.failUnlessEqual(changes[1].files, ["main.c"])
         self.failUnlessEqual(changes[1].revision, '3')
+	self.failUnlessEqual(changes[1].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
         # and now pull in r4
         doc = s.parse_logs(make_changes_output(4))
@@ -318,6 +320,7 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(changes[0].branch, None)
         self.failUnlessEqual(changes[0].revision, '4')
         self.failUnlessEqual(changes[0].files, ["version.c"])
+	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
         # and now pull in r5 (should *not* create a change as it's a
         # branch deletion
@@ -339,6 +342,7 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(changes[0].branch, 'branch')
         self.failUnlessEqual(changes[0].revision, '6')
         self.failUnlessEqual(changes[0].files, ["version.c"])
+	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
     def testFirstTime(self):
         base = "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample"
@@ -369,30 +373,6 @@ class Misc(unittest.TestCase):
         self.failUnlessEqual(len(s.pending_commands), 1)
         self.failUnlessEqual(s.pending_commands[0][0],
                              ["info", "--xml", "--non-interactive", base])
-
-class DifferentRepositories(unittest.TestCase):
-    def test1(self):
-	base = "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample"
-        s = SVNPoller(base)
-        s._prefix = "sample"
-        output = make_changes_output(4)
-	doc = s.parse_logs(output)
-
-        newlast, logentries = s._filter_new_logentries(doc, 4)
-        self.failUnlessEqual(newlast, 4)
-        self.failUnlessEqual(len(logentries), 0)
-
-        newlast, logentries = s._filter_new_logentries(doc, 3)
-        self.failUnlessEqual(newlast, 4)
-        self.failUnlessEqual(len(logentries), 1)
-
-        newlast, logentries = s._filter_new_logentries(doc, 1)
-        self.failUnlessEqual(newlast, 4)
-        self.failUnlessEqual(len(logentries), 3)
-
-        newlast, logentries = s._filter_new_logentries(doc, None)
-        self.failUnlessEqual(newlast, 4)
-        self.failUnlessEqual(len(logentries), 0)
 
 def makeTime(timestring):
     datefmt = '%Y/%m/%d %H:%M:%S'
