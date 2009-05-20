@@ -169,6 +169,7 @@ class Sender(unittest.TestCase):
         self.failUnlessEqual(c.comments, "")
         self.failUnlessEqual(c.revision, None)
         self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, None)
 
         self.options['revision'] = "r123"
         self.options['comments'] = "test change"
@@ -185,6 +186,7 @@ class Sender(unittest.TestCase):
         self.failUnlessEqual(c.comments, "test change")
         self.failUnlessEqual(c.revision, "r123")
         self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, None)
 
         # test options['logfile'] by creating a temporary file
         logfile = self.mktemp()
@@ -206,6 +208,7 @@ class Sender(unittest.TestCase):
         self.failUnlessEqual(c.comments, "longer test change")
         self.failUnlessEqual(c.revision, "r123")
         self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, None)
 
         # make sure that numeric revisions work too
         self.options['logfile'] = None
@@ -224,6 +227,7 @@ class Sender(unittest.TestCase):
         self.failUnlessEqual(c.comments, "")
         self.failUnlessEqual(c.revision, 42)
         self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, None)
 
         # verify --branch too
         self.options['branch'] = "branches/test"
@@ -241,3 +245,21 @@ class Sender(unittest.TestCase):
         self.failUnlessEqual(c.revision, 42)
         self.failUnlessEqual(c.branch, "branches/test")
         self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, None)
+	
+	self.options['repository'] = "svn://my.repository/data/project1"
+
+        d = runner.sendchange(self.options)
+        d.addCallback(self._testSender_7)
+        return d
+
+    def _testSender_7(self, res):
+        self.failUnlessEqual(len(self.cm.changes), 1)
+        c = self.cm.changes.pop()
+        self.failUnlessEqual(c.who, "alice")
+        self.failUnlessEqual(c.files, ["foo.c"])
+        self.failUnlessEqual(c.comments, "")
+        self.failUnlessEqual(c.revision, 42)
+        self.failUnlessEqual(c.branch, "branches/test")
+        self.failUnlessEqual(c.category, "categoryA")
+	self.failUnlessEqual(c.repository, "svn://my.repository/data/project1")

@@ -123,6 +123,109 @@ class Scheduling(unittest.TestCase):
         self.failUnlessEqual(len(s.changes), 3)
         self.failUnlessEqual(s.patch, None)
 
+    def testRepository(self):
+        repository1 = "svn://my.repository/data/project1"
+	repository2 = "svn://my.repository/data/project2"
+	repository3 = "svn://not.my.repository/data/project1"
+	s = scheduler.Scheduler("b1", "branch1", 2, ["a","b"],
+                                fileIsImportant=self.isImportant,
+				repository=repository1 + "/")
+        self.failUnlessEqual(s.repository, repository1) # certify slash-stripping
+	self.addScheduler(s)
+
+        c0 = Change("carol", ["important"], "other branch", branch="other",
+		    repository=repository1)
+        s.addChange(c0)
+        self.failIf(s.timer)
+        self.failIf(s.importantChanges)
+
+        c1 = Change("alice", ["important", "not important"], "some changes",
+                    branch="branch1", repository=repository1)
+        s.addChange(c1)
+        c2 = Change("bob", ["not important", "boring"], "some more changes",
+                    branch="branch1", repository=repository1)
+        s.addChange(c2)
+        c3 = Change("carol", ["important", "dull"], "even more changes",
+                    branch="branch1", repository=repository2)
+        s.addChange(c3)
+	c4 = Change("carol", ["important", "stuff"], "even more changes",
+                    branch="branch1", repository=repository3)
+        s.addChange(c4)
+	c5 = Change("carol", ["important", "stuff"], "even more changes",
+                    branch="branch1")
+        s.addChange(c5)
+        
+        self.failUnlessEqual(s.importantChanges, [c1])
+        self.failUnlessEqual(s.unimportantChanges, [c2])
+        self.failUnless(s.timer)
+
+        d = defer.Deferred()
+        reactor.callLater(4, d.callback, None)
+        d.addCallback(self._testRepository_1)
+        return d
+
+    def _testRepository_1(self, res):
+        self.failUnlessEqual(len(self.master.sets), 1)
+        s = self.master.sets[0].source
+        self.failUnlessEqual(s.branch, "branch1")
+        self.failUnlessEqual(s.revision, None)
+        self.failUnlessEqual(len(s.changes), 2)
+        self.failUnlessEqual(s.patch, None)
+
+    def testRepository2(self):
+        repository1 = "svn://my.repository/data/project1"
+	repository2 = "svn://my.repository/data/project2"
+	repository3 = "svn://not.my.repository/data/project1"
+	s = scheduler.AnyBranchScheduler("b1", None, 1, ["a","b"],
+                			 fileIsImportant=self.isImportant,
+					 repository=repository1 + "/")
+        self.failUnlessEqual(s.repository, repository1) # certify slash-stripping
+	self.addScheduler(s)
+
+        c0 = Change("carol", ["important"], "other branch", branch="other",
+		    repository=repository1)
+        s.addChange(c0)
+        c1 = Change("alice", ["important", "not important"], "some changes",
+                    branch="branch1", repository=repository1)
+        s.addChange(c1)
+        c2 = Change("bob", ["not important", "boring"], "some more changes",
+                    branch="branch1", repository=repository1)
+        s.addChange(c2)
+        c3 = Change("carol", ["important", "dull"], "even more changes",
+                    branch="branch1", repository=repository2)
+        s.addChange(c3)
+	c4 = Change("carol", ["important", "stuff"], "even more changes",
+                    branch="branch1", repository=repository3)
+        s.addChange(c4)
+	c5 = Change("carol", ["important", "stuff"], "even more changes",
+                    branch="branch1")
+        s.addChange(c5)
+        
+	self.failUnlessEqual(s.schedulers["other"].importantChanges, [c0])
+        self.failUnlessEqual(s.schedulers["branch1"].importantChanges, [c1])
+        self.failUnlessEqual(s.schedulers["branch1"].unimportantChanges, [c2])
+
+        d = defer.Deferred()
+        reactor.callLater(4, d.callback, None)
+        d.addCallback(self._testRepository_2)
+        return d
+
+    def _testRepository_2(self, res):
+        self.failUnlessEqual(len(self.master.sets), 2)
+	self.master.sets.sort(lambda a,b: cmp(a.source.branch,
+                                              b.source.branch))
+        
+	s = self.master.sets[0].source
+        self.failUnlessEqual(s.branch, "branch1")
+        self.failUnlessEqual(s.revision, None)
+        self.failUnlessEqual(len(s.changes), 2)
+        self.failUnlessEqual(s.patch, None)
+	
+	s = self.master.sets[1].source
+        self.failUnlessEqual(s.branch, "other")
+        self.failUnlessEqual(s.revision, None)
+        self.failUnlessEqual(len(s.changes), 1)
+        self.failUnlessEqual(s.patch, None)
 
     def testAnyBranch(self):
         s = scheduler.AnyBranchScheduler("b1", None, 1, ["a","b"],

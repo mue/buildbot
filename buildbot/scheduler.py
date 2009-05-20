@@ -91,7 +91,8 @@ class Scheduler(BaseUpstreamScheduler):
                      'fileIsImportant', 'properties', 'categories')
     
     def __init__(self, name, branch, treeStableTimer, builderNames,
-                 fileIsImportant=None, properties={}, categories=None):
+                 fileIsImportant=None, properties={}, categories=None,
+		 repository=None):
         """
         @param name: the name of this Scheduler
         @param branch: The branch name that the Scheduler should pay
@@ -117,6 +118,10 @@ class Scheduler(BaseUpstreamScheduler):
         @param properties: properties to apply to all builds started from this 
                            scheduler
         @param categories: A list of categories of changes to accept
+	@param repository: The repository that the Scheduler should pay
+			   attention to. Any Change that is not on this
+			   repository will be ignored. It can be set to None
+			   to pay attention to every Change.
         """
 
         BaseUpstreamScheduler.__init__(self, name, properties)
@@ -138,6 +143,9 @@ class Scheduler(BaseUpstreamScheduler):
         self.nextBuildTime = None
         self.timer = None
         self.categories = categories
+	if repository is not None and repository.endswith("/"):
+	    repository = repository[:-1] # strip the trailing slash
+	self.repository = repository
 
     def listBuilderNames(self):
         return self.builderNames
@@ -148,7 +156,17 @@ class Scheduler(BaseUpstreamScheduler):
         return []
 
     def addChange(self, change):
-        if change.branch != self.branch:
+        # ignore changes on the wrong repository
+	if self.repository is not None and change.repository is not None\
+	   and self.repository != change.repository:
+	    log.msg("%s ignoring repository %s" % (self, change.repository))
+            return
+	# ignore changes if we pay attention only to a particular repository and
+	# the change has no repository set
+	if self.repository is not None and change.repository is None:
+	    log.msg("%s ignoring change without repository %s" % (self, change))
+            return
+	if change.branch != self.branch:
             log.msg("%s ignoring off-branch %s" % (self, change))
             return
         if self.categories is not None and change.category not in self.categories:
@@ -218,7 +236,7 @@ class AnyBranchScheduler(BaseUpstreamScheduler):
                      'fileIsImportant', 'properties')
 
     def __init__(self, name, branches, treeStableTimer, builderNames,
-                 fileIsImportant=None, properties={}):
+                 fileIsImportant=None, properties={}, repository=None):
         """
         @param name: the name of this Scheduler
         @param branches: The branch names that the Scheduler should pay
@@ -266,6 +284,9 @@ class AnyBranchScheduler(BaseUpstreamScheduler):
             assert callable(fileIsImportant)
             self.fileIsImportant = fileIsImportant
         self.schedulers = {} # one per branch
+	if repository is not None and repository.endswith("/"):
+	    repository = repository[:-1] # strip the trailing slash
+	self.repository = repository
 
     def __repr__(self):
         return "<AnyBranchScheduler '%s'>" % self.name
@@ -286,6 +307,19 @@ class AnyBranchScheduler(BaseUpstreamScheduler):
         pass
 
     def addChange(self, change):
+	# the check for the repository is done here, to prevent the creation
+	# of useless instances of Scheduler
+	
+	# ignore changes on the wrong repository
+	if self.repository is not None and change.repository is not None\
+	   and self.repository != change.repository:
+	    log.msg("%s ignoring repository %s" % (self, change.repository))
+            return
+	# ignore changes if we pay attention only to a particular repository and
+	# the change has no repository set
+	if self.repository is not None and change.repository is None:
+	    log.msg("%s ignoring change without repository %s" % (self, change))
+            return
         branch = change.branch
         if self.branches is not None and branch not in self.branches:
             log.msg("%s ignoring off-branch %s" % (self, change))
@@ -299,10 +333,11 @@ class AnyBranchScheduler(BaseUpstreamScheduler):
             s = self.schedulerFactory(name, branch,
                                       self.treeStableTimer,
                                       self.builderNames,
-                                      self.fileIsImportant)
+                                      fileIsImportant=self.fileIsImportant,
+				      repository=self.repository)
             s.successWatchers = self.successWatchers
             s.setServiceParent(self)
-            s.properties = self.properties
+	    s.properties = self.properties
             # TODO: does this result in schedulers that stack up forever?
             # When I make the persistify-pass, think about this some more.
             self.schedulers[branch] = s

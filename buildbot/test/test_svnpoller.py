@@ -370,6 +370,30 @@ class Misc(unittest.TestCase):
         self.failUnlessEqual(s.pending_commands[0][0],
                              ["info", "--xml", "--non-interactive", base])
 
+class DifferentRepositories(unittest.TestCase):
+    def test1(self):
+	base = "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample"
+        s = SVNPoller(base)
+        s._prefix = "sample"
+        output = make_changes_output(4)
+	doc = s.parse_logs(output)
+
+        newlast, logentries = s._filter_new_logentries(doc, 4)
+        self.failUnlessEqual(newlast, 4)
+        self.failUnlessEqual(len(logentries), 0)
+
+        newlast, logentries = s._filter_new_logentries(doc, 3)
+        self.failUnlessEqual(newlast, 4)
+        self.failUnlessEqual(len(logentries), 1)
+
+        newlast, logentries = s._filter_new_logentries(doc, 1)
+        self.failUnlessEqual(newlast, 4)
+        self.failUnlessEqual(len(logentries), 3)
+
+        newlast, logentries = s._filter_new_logentries(doc, None)
+        self.failUnlessEqual(newlast, 4)
+        self.failUnlessEqual(len(logentries), 0)
+
 def makeTime(timestring):
     datefmt = '%Y/%m/%d %H:%M:%S'
     when = time.mktime(time.strptime(timestring, datefmt))

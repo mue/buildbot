@@ -13,6 +13,7 @@ from buildbot import interfaces, util
 html_tmpl = """
 <p>Changed by: <b>%(who)s</b><br />
 Changed at: <b>%(at)s</b><br />
+%(repository)s
 %(branch)s
 %(revision)s
 <br />
@@ -54,7 +55,8 @@ class Change:
     revision = None # used to create a source-stamp
 
     def __init__(self, who, files, comments, isdir=0, links=[],
-                 revision=None, when=None, branch=None, category=None):
+                 revision=None, when=None, branch=None, category=None,
+		 repository=None):
         self.who = who
         self.comments = comments
         self.isdir = isdir
@@ -65,6 +67,7 @@ class Change:
         self.when = when
         self.branch = branch
         self.category = category
+	self.repository = repository
 
         # keep a sorted list of the files, for easier display
         self.files = files[:]
@@ -90,16 +93,20 @@ class Change:
         revision = ""
         if self.revision:
             revision = "Revision: <b>%s</b><br />\n" % self.revision
-        branch = ""
+        repository = ""
+	if self.repository:
+	    repository = "Repository: <b>%s</b><br />\n" % self.repository
+	branch = ""
         if self.branch:
             branch = "Branch: <b>%s</b><br />\n" % self.branch
 
-        kwargs = { 'who'     : html.escape(self.who),
-                   'at'      : self.getTime(),
-                   'files'   : html.UL(links) + '\n',
-                   'revision': revision,
-                   'branch'  : branch,
-                   'comments': html.PRE(self.comments) }
+        kwargs = { 'who'       : html.escape(self.who),
+                   'at'        : self.getTime(),
+                   'files'     : html.UL(links) + '\n',
+                   'revision'  : revision,
+		   'repository': repository,
+                   'branch'    : branch,
+                   'comments'  : html.PRE(self.comments) }
         return html_tmpl % kwargs
 
     def get_HTML_box(self, url):
@@ -215,9 +222,13 @@ class ChangeMaster(service.MultiService):
         """Deliver a file change event. The event should be a Change object.
         This method will timestamp the object as it is received."""
         log.msg("adding change, who %s, %d files, rev=%s, branch=%s, "
-                "comments %s, category %s" % (change.who, len(change.files),
-                                              change.revision, change.branch,
-                                              change.comments, change.category))
+                "repository %s, comments %s, category %s" % (change.who,
+							     len(change.files),
+							     change.revision,
+							     change.branch,
+							     change.repository,
+							     change.comments,
+							     change.category))
         change.number = self.nextNumber
         self.nextNumber += 1
         self.changes.append(change)
