@@ -156,21 +156,17 @@ class BzrExtractor(SourceStampExtractor):
     patchlevel = 0
     vcexe = "bzr"
     def getBaseRevision(self):
-        d = self.dovc(["version-info"])
+        d = self.dovc(["revision-info","-rsubmit:"])
         d.addCallback(self.get_revision_number)
         return d
+
     def get_revision_number(self, out):
-        for line in out.split("\n"):
-            colon = line.find(":")
-            if colon != -1:
-                key, value = line[:colon], line[colon+2:]
-                if key == "revno":
-                    self.baserev = int(value)
-                    return
-        raise ValueError("unable to find revno: in bzr output: '%s'" % out)
+        revno, revid= out.split()
+        self.baserev = 'revid:' + revid
+        return
 
     def getPatch(self, res):
-        d = self.dovc(["diff"])
+        d = self.dovc(["diff","-r%s.." % self.baserev])
         d.addCallback(self.readPatch, self.patchlevel)
         return d
 
@@ -380,15 +376,12 @@ class Try(pb.Referenceable):
 
     def __init__(self, config):
         self.config = config
-        self.opts = runner.loadOptions()
-        self.connect = self.getopt('connect', 'try_connect')
+        self.connect = self.getopt('connect')
         assert self.connect, "you must specify a connect style: ssh or pb"
-        self.builderNames = self.getopt('builders', 'try_builders')
+        self.builderNames = self.getopt('builders')
 
-    def getopt(self, config_name, options_name, default=None):
+    def getopt(self, config_name, default=None):
         value = self.config.get(config_name)
-        if value is None or value == []:
-            value = self.opts.get(options_name)
         if value is None or value == []:
             value = default
         return value
@@ -396,14 +389,14 @@ class Try(pb.Referenceable):
     def createJob(self):
         # returns a Deferred which fires when the job parameters have been
         # created
-        opts = self.opts
+
         # generate a random (unique) string. It would make sense to add a
         # hostname and process ID here, but a) I suspect that would cause
         # windows portability problems, and b) really this is good enough
         self.bsid = "%d-%s" % (time.time(), random.randint(0, 1000000))
 
         # common options
-        branch = self.getopt("branch", "try_branch")
+        branch = self.getopt("branch")
 
         difffile = self.config.get("diff")
         if difffile:
@@ -416,14 +409,14 @@ class Try(pb.Referenceable):
             ss = SourceStamp(branch, baserev, patch)
             d = defer.succeed(ss)
         else:
-            vc = self.getopt("vc", "try_vc")
+            vc = self.getopt("vc")
             if vc in ("cvs", "svn"):
                 # we need to find the tree-top
-                topdir = self.getopt("try_topdir", "try_topdir")
+                topdir = self.getopt("try-topdir")
                 if topdir:
                     treedir = os.path.expanduser(topdir)
                 else:
-                    topfile = self.getopt("try-topfile", "try_topfile")
+                    topfile = self.getopt("try-topfile")
                     treedir = getTopdir(topfile)
             else:
                 treedir = os.getcwd()
@@ -457,12 +450,11 @@ class Try(pb.Referenceable):
 
     def deliverJob(self):
         # returns a Deferred that fires when the job has been delivered
-        opts = self.opts
 
         if self.connect == "ssh":
-            tryhost = self.getopt("tryhost", "try_host")
-            tryuser = self.getopt("username", "try_username")
-            trydir = self.getopt("trydir", "try_dir")
+            tryhost = self.getopt("tryhost")
+            tryuser = self.getopt("username")
+            trydir = self.getopt("trydir")
 
             argv = ["ssh", "-l", tryuser, tryhost,
                     "buildbot", "tryserver", "--jobdir", trydir]
@@ -473,9 +465,9 @@ class Try(pb.Referenceable):
             d = pp.d
             return d
         if self.connect == "pb":
-            user = self.getopt("username", "try_username")
-            passwd = self.getopt("passwd", "try_password")
-            master = self.getopt("master", "try_master")
+            user = self.getopt("username")
+            passwd = self.getopt("passwd")
+            master = self.getopt("master")
             tryhost, tryport = master.split(":")
             tryport = int(tryport)
             f = pb.PBClientFactory()
@@ -518,7 +510,7 @@ class Try(pb.Referenceable):
             self._getStatus_1()
         # contact the status port
         # we're probably using the ssh style
-        master = self.getopt("master", "masterstatus")
+        master = self.getopt("master")
         host, port = master.split(":")
         port = int(port)
         self.announce("contacting the status port at %s:%d" % (host, port))
@@ -668,6 +660,36 @@ class Try(pb.Referenceable):
             self.exitcode = 1
         self.running.callback(self.exitcode)
 
+    def getAvailableBuilderNames(self):
+        # This logs into the master using the PB protocol to
+        # get the names of the configured builders that can
+        # be used for the --builder argument
+        opts = self.opts
+        if self.connect == "pb":
+            user = self.getopt("username", "try_username")
+            passwd = self.getopt("passwd", "try_password")
+            master = self.getopt("master", "try_master")
+            tryhost, tryport = master.split(":")
+            tryport = int(tryport)
+            f = pb.PBClientFactory()
+            d = f.login(credentials.UsernamePassword(user, passwd))
+            reactor.connectTCP(tryhost, tryport, f)
+            d.addCallback(self._getBuilderNames, self._getBuilderNames2)
+            return d
+        if self.connect == "ssh":
+            raise RuntimeError("ssh connection type not supported for this command")
+        raise RuntimeError("unknown connecttype '%s', should be 'pb'" % self.connect)
+
+    def _getBuilderNames(self, remote, output):
+        d = remote.callRemote("getAvailableBuilderNames")
+        d.addCallback(self._getBuilderNames2)
+        return d
+
+    def _getBuilderNames2(self, buildernames):
+        print "The following builders are available for the try scheduler: "
+        for buildername in buildernames:
+            print buildername
+
     def announce(self, message):
         if not self.quiet:
             print message
@@ -678,14 +700,17 @@ class Try(pb.Referenceable):
         print "using '%s' connect method" % self.connect
         self.exitcode = 0
         d = defer.Deferred()
-        d.addCallback(lambda res: self.createJob())
-        d.addCallback(lambda res: self.announce("job created"))
-        deliver = self.deliverJob
-        if bool(self.config.get("dryrun")):
-            deliver = self.fakeDeliverJob
-        d.addCallback(lambda res: deliver())
-        d.addCallback(lambda res: self.announce("job has been delivered"))
-        d.addCallback(lambda res: self.getStatus())
+        if bool(self.config.get("get-builder-names")):
+            d.addCallback(lambda res: self.getAvailableBuilderNames())
+        else:
+            d.addCallback(lambda res: self.createJob())
+            d.addCallback(lambda res: self.announce("job created"))
+            deliver = self.deliverJob
+            if bool(self.config.get("dryrun")):
+                deliver = self.fakeDeliverJob
+            d.addCallback(lambda res: deliver())
+            d.addCallback(lambda res: self.announce("job has been delivered"))
+            d.addCallback(lambda res: self.getStatus())
         d.addErrback(log.err)
         d.addCallback(self.cleanup)
         d.addCallback(lambda res: reactor.stop())

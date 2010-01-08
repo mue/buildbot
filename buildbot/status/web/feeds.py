@@ -25,13 +25,17 @@
 
 import os
 import re
-import sys
 import time
 from twisted.web import resource
-from buildbot.status.builder import SUCCESS, WARNINGS, FAILURE, EXCEPTION
+from buildbot.status.builder import FAILURE
 
 class XmlResource(resource.Resource):
     contentType = "text/xml; charset=UTF-8"
+    docType = ''
+        
+    def getChild(self, name, request):
+        return self
+    
     def render(self, request):
         data = self.content(request)
         request.setHeader("content-type", self.contentType)
@@ -39,21 +43,6 @@ class XmlResource(resource.Resource):
             request.setHeader("content-length", len(data))
             return ''
         return data
-    docType = ''
-    def header (self, request):
-        data = ('<?xml version="1.0"?>\n')
-        return data
-    def footer(self, request):
-        data = ''
-        return data
-    def content(self, request):
-        data = self.docType
-        data += self.header(request)
-        data += self.body(request)
-        data += self.footer(request)
-        return data
-    def body(self, request):
-        return ''
 
 class FeedResource(XmlResource):
     title = None
@@ -62,7 +51,7 @@ class FeedResource(XmlResource):
     description = 'Dummy rss'
     status = None
 
-    def __init__(self, status, categories=None, title=None):
+    def __init__(self, status, categories = None, title = None):
         self.status = status
         self.categories = categories
         self.title = title
@@ -73,6 +62,7 @@ class FeedResource(XmlResource):
         self.user = self.getEnv(['USER', 'USERNAME'], 'buildmaster')
         self.hostname = self.getEnv(['HOSTNAME', 'COMPUTERNAME'],
                                     'buildmaster')
+        self.children = {}
 
     def getEnv(self, keys, fallback):
         for key in keys:
@@ -139,24 +129,21 @@ class FeedResource(XmlResource):
                     break
 
         # Sort build list by date, youngest first.
-        if sys.version_info[:3] >= (2,4,0):
-            builds.sort(key=lambda build: build.getTimes(), reverse=True)
-        else:
-            # If you need compatibility with python < 2.4, use this for
-            # sorting instead:
-            # We apply Decorate-Sort-Undecorate
-            deco = [(build.getTimes(), build) for build in builds]
-            deco.sort()
-            deco.reverse()
-            builds = [build for (b1, build) in deco]
+        # To keep compatibility with python < 2.4, use this for sorting instead:
+        # We apply Decorate-Sort-Undecorate
+        deco = [(build.getTimes(), build) for build in builds]
+        deco.sort()
+        deco.reverse()
+        builds = [build for (b1, build) in deco]
 
         if builds:
             builds = builds[:min(len(builds), maxFeeds)]
         return builds
 
-    def body (self, request):
-        data = ''
+    def content(self, request):
         builds = self.getBuilds(request)
+        
+        build_cxts = []
 
         for build in builds:
             start, finished = build.getTimes()
@@ -190,177 +177,85 @@ class FeedResource(XmlResource):
             title = ('%s failed on "%s"' %
                      (source, build.getBuilder().getName()))
 
-            # get name of the failed step and the last 30 lines of its log.
-            if build.getLogs():
-                log = build.getLogs()[-1]
-                laststep = log.getStep().getName()
-                try:
-                    lastlog = log.getText()
-                except IOError:
-                    # Probably the log file has been removed
-                    lastlog='<b>log file not available</b>'
+            
+            # Add information about the failing steps.
+            failed_steps = []
+            log_lines = []
+            for s in build.getSteps():
+                if s.getResults()[0] == FAILURE:
+                    failed_steps.append(s.getName())
 
-            lines = re.split('\n', lastlog)
-            lastlog = ''
-            for logline in lines[max(0, len(lines)-30):]:
-                lastlog = lastlog + logline + '<br/>'
-            lastlog = lastlog.replace('\n', '<br/>')
+                    # Add the last 30 lines of each log.
+                    for log in s.getLogs():
+                        log_lines.append('Last lines of build log "%s":' % log.getName())
+                        log_lines.append([])
+                        try:
+                            logdata = log.getText()
+                        except IOError:
+                            # Probably the log file has been removed
+                            logdata ='** log file not available **'
 
-            description = ''
-            description += ('Date: %s<br/><br/>' %
-                            time.strftime("%a, %d %b %Y %H:%M:%S GMT",
-                                          finishedTime))
-            description += ('Full details available here: <a href="%s">%s</a><br/>' %
-                            (self.link, self.projectName))
-            builder_summary_link = ('%s/builders/%s' %
-                                    (re.sub(r'/index.html', '', self.link),
-                                     build.getBuilder().getName()))
-            description += ('Build summary: <a href="%s">%s</a><br/><br/>' %
-                            (builder_summary_link,
-                             build.getBuilder().getName()))
-            description += ('Build details: <a href="%s">%s</a><br/><br/>' %
-                            (link, link))
-            description += ('Author list: <b>%s</b><br/><br/>' %
-                            ",".join(build.getResponsibleUsers()))
-            description += ('Failed step: <b>%s</b><br/><br/>' % laststep)
-            description += 'Last lines of the build log:<br/>'
+                        log_lines.extend(logdata.split('\n')[-30:])
 
-            data += self.item(title, description=description, lastlog=lastlog,
-                              link=link, pubDate=finishedTime)
 
-        return data
+            bc = {}
+            bc['date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", finishedTime)
+            bc['summary_link'] = ('%sbuilders/%s' %
+                                  (self.link,
+                                   build.getBuilder().getName()))            
+            bc['name'] = build.getBuilder().getName()
+            bc['number'] = build.getNumber()
+            bc['responsible_users'] = build.getResponsibleUsers()
+            bc['failed_steps'] = failed_steps
+            bc['title'] = title
+            bc['link'] = link
+            bc['log_lines'] = log_lines
+    
+            if finishedTime is not None:
+                bc['rfc822_pubdate'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                              finishedTime)
+                bc['rfc3339_pubdate'] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                               finishedTime)
+                
+                # Every RSS/Atom item must have a globally unique ID
+                guid = ('tag:%s@%s,%s:%s' % (self.user, self.hostname,
+                                             time.strftime("%Y-%m-%d", finishedTime),
+                                             time.strftime("%Y%m%d%H%M%S", finishedTime)))
+                bc['guid'] = guid            
+            
+            build_cxts.append(bc)
 
-    def item(self, title='', link='', description='', pubDate=''):
-        """Generates xml for one item in the feed."""
+        title = self.title
+        if not title:
+            title = 'Build status of ' + self.projectName
+
+        cxt = {}
+        cxt['title'] = title
+        cxt['project_url'] = self.link
+        cxt['project_name'] = self.projectName
+        cxt['language'] = self.language
+        cxt['description'] = self.description
+        if self.pubdate is not None:
+            cxt['rfc822_pubdate'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                           self.pubdate)
+            cxt['rfc3339_pubdate'] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   self.pubdate)
+        
+        cxt['builds'] = build_cxts
+        template = request.site.buildbot_service.templates.get_template(self.template_file)
+        return template.render(**cxt).encode('utf-8').strip()
 
 class Rss20StatusResource(FeedResource):
+    # contentType = 'application/rss+xml' (browser dependent)
+    template_file = 'feed_rss20.xml'
+
     def __init__(self, status, categories=None, title=None):
         FeedResource.__init__(self, status, categories, title)
-        contentType = 'application/rss+xml'
-
-    def header(self, request):
-        data = FeedResource.header(self, request)
-        data += ('<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n')
-        data += ('  <channel>\n')
-        if self.title is None:
-            title = 'Build status of ' + self.projectName
-        else:
-            title = self.title
-        data += ('    <title>%s</title>\n' % title)
-        if self.link is not None:
-            data += ('    <link>%s</link>\n' % self.link)
-        link = re.sub(r'/index.html', '', self.link)
-        data += ('    <atom:link href="%s/rss" rel="self" type="application/rss+xml"/>\n' % link)
-        if self.language is not None:
-            data += ('    <language>%s</language>\n' % self.language)
-        if self.description is not None:
-            data += ('    <description>%s</description>\n' % self.description)
-        if self.pubdate is not None:
-            rfc822_pubdate = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
-                                           self.pubdate)
-            data += ('    <pubDate>%s</pubDate>\n' % rfc822_pubdate)
-        return data
-
-    def item(self, title='', link='', description='', lastlog='', pubDate=''):
-        data = ('      <item>\n')
-        data += ('        <title>%s</title>\n' % title)
-        if link is not None:
-            data += ('        <link>%s</link>\n' % link)
-        if (description is not None and lastlog is not None):
-            lastlog = re.sub(r'<br/>', "\n", lastlog)
-            lastlog = re.sub(r'&', "&amp;", lastlog)
-            lastlog = re.sub(r"'", "&apos;", lastlog)
-            lastlog = re.sub(r'"', "&quot;", lastlog)
-            lastlog = re.sub(r'<', '&lt;', lastlog)
-            lastlog = re.sub(r'>', '&gt;', lastlog)
-            lastlog = lastlog.replace('\n', '<br/>')
-            content = '<![CDATA['
-            content += description
-            content += lastlog
-            content += ']]>'
-            data += ('        <description>%s</description>\n' % content)
-        if pubDate is not None:
-            rfc822pubDate = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
-                                          pubDate)
-            data += ('        <pubDate>%s</pubDate>\n' % rfc822pubDate)
-            # Every RSS item must have a globally unique ID
-            guid = ('tag:%s@%s,%s:%s' % (self.user, self.hostname,
-                                         time.strftime("%Y-%m-%d", pubDate),
-                                         time.strftime("%Y%m%d%H%M%S",
-                                                       pubDate)))
-            data += ('    <guid isPermaLink="false">%s</guid>\n' % guid)
-        data += ('      </item>\n')
-        return data
-
-    def footer(self, request):
-        data = ('  </channel>\n'
-                '</rss>')
-        return data
 
 class Atom10StatusResource(FeedResource):
+    # contentType = 'application/atom+xml' (browser dependent)
+    template_file = 'feed_atom10.xml'
+
     def __init__(self, status, categories=None, title=None):
         FeedResource.__init__(self, status, categories, title)
-        contentType = 'application/atom+xml'
 
-    def header(self, request):
-        data = FeedResource.header(self, request)
-        data += '<feed xmlns="http://www.w3.org/2005/Atom">\n'
-        data += ('  <id>%s</id>\n' % self.link)
-        if self.title is None:
-            title = 'Build status of ' + self.projectName
-        else:
-            title = self.title
-        data += ('  <title>%s</title>\n' % title)
-        if self.link is not None:
-            link = re.sub(r'/index.html', '', self.link)
-            data += ('  <link rel="self" href="%s/atom"/>\n' % link)
-            data += ('  <link rel="alternate" href="%s/"/>\n' % link)
-        if self.description is not None:
-            data += ('  <subtitle>%s</subtitle>\n' % self.description)
-        if self.pubdate is not None:
-            rfc3339_pubdate = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                            self.pubdate)
-            data += ('  <updated>%s</updated>\n' % rfc3339_pubdate)
-        data += ('  <author>\n')
-        data += ('    <name>Build Bot</name>\n')
-        data += ('  </author>\n')
-        return data
-
-    def item(self, title='', link='', description='', lastlog='', pubDate=''):
-        data = ('  <entry>\n')
-        data += ('    <title>%s</title>\n' % title)
-        if link is not None:
-            data += ('    <link href="%s"/>\n' % link)
-        if (description is not None and lastlog is not None):
-            lastlog = re.sub(r'<br/>', "\n", lastlog)
-            lastlog = re.sub(r'&', "&amp;", lastlog)
-            lastlog = re.sub(r"'", "&apos;", lastlog)
-            lastlog = re.sub(r'"', "&quot;", lastlog)
-            lastlog = re.sub(r'<', '&lt;', lastlog)
-            lastlog = re.sub(r'>', '&gt;', lastlog)
-            data += ('    <content type="xhtml">\n')
-            data += ('      <div xmlns="http://www.w3.org/1999/xhtml">\n')
-            data += ('        %s\n' % description)
-            data += ('        <pre xml:space="preserve">%s</pre>\n' % lastlog)
-            data += ('      </div>\n')
-            data += ('    </content>\n')
-        if pubDate is not None:
-            rfc3339pubDate = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                           pubDate)
-            data += ('    <updated>%s</updated>\n' % rfc3339pubDate)
-            # Every Atom entry must have a globally unique ID
-            # http://diveintomark.org/archives/2004/05/28/howto-atom-id
-            guid = ('tag:%s@%s,%s:%s' % (self.user, self.hostname,
-                                         time.strftime("%Y-%m-%d", pubDate),
-                                         time.strftime("%Y%m%d%H%M%S",
-                                                       pubDate)))
-            data += ('    <id>%s</id>\n' % guid)
-        data += ('    <author>\n')
-        data += ('      <name>Build Bot</name>\n')
-        data += ('    </author>\n')
-        data += ('  </entry>\n')
-        return data
-
-    def footer(self, request):
-        data = ('</feed>')
-        return data

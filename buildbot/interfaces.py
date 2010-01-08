@@ -1,4 +1,3 @@
-
 """Interface documentation.
 
 Define the interfaces that are implemented by various buildbot classes.
@@ -342,6 +341,9 @@ class IBuilderStatus(Interface):
     def getName():
         """Return the name of this Builder (a string)."""
 
+    def getCategory():
+        """Return the category of this builder (a string)."""
+
     def getState():
         # TODO: this isn't nearly as meaningful as it used to be
         """Return a tuple (state, builds) for this Builder. 'state' is the
@@ -440,7 +442,7 @@ class IBuilderStatus(Interface):
         delivered."""
 
 class IEventSource(Interface):
-    def eventGenerator(branches=[]):
+    def eventGenerator(branches=[], categories=[]):
         """This function creates a generator which will yield all of this
         object's status events, starting with the most recent and progressing
         backwards in time. These events provide the IStatusEvent interface.
@@ -451,6 +453,11 @@ class IEventSource(Interface):
         return events that are associated with these branches. If the list is
         empty, events for all branches should be returned (i.e. an empty list
         means 'accept all' rather than 'accept none').
+
+        @param categories: a list of category names.  The generator
+        should only return events that are categorized within the
+        given category.  If the list is empty, events for all
+        categories should be returned.
         """
 
 class IBuildStatus(Interface):
@@ -556,8 +563,8 @@ class IBuildStatus(Interface):
 
     def getResults():
         """Return a constant describing the results of the build: one of the
-        constants in buildbot.status.builder: SUCCESS, WARNINGS, or
-        FAILURE."""
+        constants in buildbot.status.builder: SUCCESS, WARNINGS,
+        FAILURE, SKIPPED or EXCEPTION."""
 
     def getLogs():
         """Return a list of logs that describe the build as a whole. Some
@@ -882,6 +889,13 @@ class IStatusReceiver(Interface):
         @type request: implementor of L{IBuildRequestStatus}
         """
 
+    def requestCancelled(builder, request):
+        """A BuildRequest has been cancelled on the given Builder.
+
+        @type builder: L{buildbot.status.builder.BuilderStatus}
+        @type request: implementor of L{IBuildRequestStatus}
+        """
+
     def builderAdded(builderName, builder):
         """
         A new Builder has just been added. This method may return an
@@ -1028,12 +1042,13 @@ class IBuilderControl(Interface):
         the build that is currently in progress: once the build finishes,
         there is nothing to control anymore."""
 
-    def ping(timeout=30):
+    def ping():
         """Attempt to contact the slave and see if it is still alive. This
         returns a Deferred which fires with either True (the slave is still
-        alive) or False (the slave did not respond). As a side effect, adds
-        an event to this builder's column in the waterfall display
-        containing the results of the ping."""
+        alive) or False (the slave did not respond). As a side effect, adds an
+        event to this builder's column in the waterfall display containing the
+        results of the ping. Note that this may not fail for a long time, it is
+        implemented in terms of the timeout on the underlying TCP connection."""
         # TODO: this ought to live in ISlaveControl, maybe with disconnect()
         # or something. However the event that is emitted is most useful in
         # the Builder column, so it kinda fits here too.

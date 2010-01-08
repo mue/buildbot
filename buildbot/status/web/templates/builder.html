@@ -1,0 +1,122 @@
+{% from 'build_line.html' import build_table %}
+{% import 'forms.html' as forms %}
+
+{% extends "layout.html" %}
+{% block content %}
+
+<h1>Builder {{ name }}</h1>
+
+<p>(<a href="{{ path_to_root }}waterfall?show={{ name }}">view in waterfall</a>)</p>
+
+<div class="column">
+
+{% if current %}
+  <h2>Current Builds:</h2>
+  <ul>
+  {% for b in current %}
+    <li><a href="{{ b.link }}">{{ b.num }}</a>
+    {% if b.when %}
+      ETA: {{ b.when_time }} [{{ b.when }}s]
+    {% endif %}
+
+    {{ b.current_step }}
+
+    {% if b.stop_url %}
+      <form method="post" action="{{ b.stop_url }}" class="command stopbuild" style="display:inline">
+        <input type="submit" value="Stop Build" />
+      </form>
+    {% endif %}    
+    </li>
+  {% endfor %}
+  </ul>
+{% else %}
+  <h2>No current builds</h2>
+{% endif %}    
+ 
+{% if pending %}
+  <h2>Pending builds:</h2>
+  <ul>
+  {% for b in pending %}
+    <li><font size="-1">({{ b.when }}, waiting {{ b.delay }})</font> 
+    
+    {% if cancel_url %}
+      <form method="post" action="{{ cancel_url }}" class="command cancelbuild" style="display:inline">
+        <input type="hidden" name="id" value="{{ b.id }}" />
+        <input type="submit" value="Cancel Build" />
+      </form>
+    {% endif %}    
+    
+    {% if b.changes %}
+      {% for c in b.changes %}<a href="{{ c.url }}">{{ c.who }}</a>{% endfor %}
+    {% else %}
+      {{ b.reason }}
+    {% endif %}    
+
+    </li>
+  {% endfor %}
+  </ul>  
+  
+  {% if cancel_url %}
+    <form method="pos" action="{{ cancel_url }}" class="command cancelbuild" style="display:inline">
+      <input type="hidden" name="id" value="all" />
+      <input type="submit" value="Cancel All" />
+    </form>
+   {% endif %}
+     
+{% else %}
+  <h2>No pending builds</h2>
+{% endif %}
+
+<h2>Recent Builds:</h2>
+
+{{ build_table(recent) }}
+
+</div>
+<div class="column">
+
+<h2>Buildslaves:</h2>
+<table class="info">
+{% if slaves %}
+<tr>
+  <th>Name</th>
+  <th>Status</th>
+  <th>Admin</th>
+</tr>
+{% endif %}
+{% for s in slaves %}
+  <tr class="{{ loop.cycle('alt', '') }}">
+  <td><b><a href="{{ s.link|e }}">{{ s.name|e }}</a></b></td>
+  {% if s.connected %}
+    <td class="idle">connected</td>
+    <td>{{ s.admin|e if s.admin }}</td>
+  {% else %}
+    <td class="offline">offline</td> 
+    <td/>
+  {% endif %}
+  </tr>
+{% else %}
+  <td>no slaves attached</td>
+{% endfor %}
+</table>
+
+{% if ping_url %}
+  <h2>Ping slaves</h2>
+  <form method="post" action="{{ ping_url }}" class="command pingbuilder">
+    <p>To ping the buildslave(s), push the 'Ping' button</p>
+    <input type="submit" value="Ping Builder" />
+  </form>
+{% endif %}
+
+{% if force_url %}
+  <h2>Force build</h2>
+  {{ forms.force_build(force_url, use_user_passwd) }}
+{% endif %}
+
+{% if all_slaves_offline %}
+  <p>All buildslaves appear to be offline, so it's not possible
+  to force this build to execute at this time.</p>
+{% endif %}
+
+</div>
+
+{% endblock %}

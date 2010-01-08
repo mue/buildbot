@@ -13,6 +13,7 @@ Standard setup script.
 import sys
 import os
 import re
+import glob
 
 from distutils.core import setup, Command
 from buildbot import version
@@ -20,6 +21,13 @@ from buildbot import version
 # Path: twisted!cvstoys!buildbot
 from distutils.command.install_data import install_data
 
+def include(d, e):
+    """Generate a pair of (directory, file-list) for installation.
+
+    'd' -- A directory
+    'e' -- A glob pattern"""
+    
+    return (d, [f for f in glob.glob('%s/%s'%(d, e)) if os.path.isfile(f)])
 
 class _SetupBuildCommand(Command):
     """
@@ -101,7 +109,7 @@ class SdistTestCommand(TestCommand):
                     os.rmdir(os.path.join(root, name))
         # Import setup making it as if we ran setup.py with the sdist arg
         sys.argv.append('sdist')
-        import setup
+        import setup #@Reimport @UnresolvedImport @UnusedImport
         try:
             # attempt to extract the sdist data
             from gzip import GzipFile
@@ -199,10 +207,11 @@ setup_args = {
     'data_files': [("buildbot", ["buildbot/buildbot.png"]),
                 ("buildbot/clients", ["buildbot/clients/debug.glade"]),
                 ("buildbot/status/web",
-                 ["buildbot/status/web/classic.css",
-                  "buildbot/status/web/index.html",
+                 ["buildbot/status/web/default.css",
+                  "buildbot/status/web/bg_gradient.jpg",
                   "buildbot/status/web/robots.txt",
                   ]),
+                include("buildbot/status/web/templates", '*.html'),
                 ("buildbot/scripts", ["buildbot/scripts/sample.cfg"]),
                 ("buildbot/test/mail", testmsgs),
                 ("buildbot/test/subdir", ["buildbot/test/subdir/emit.py"]),
@@ -216,11 +225,14 @@ setup_args = {
 try:
     # If setuptools is installed, then we'll add setuptools-specific arguments
     # to the setup args.
-    import setuptools
+    import setuptools #@UnusedImport
 except ImportError:
     pass
 else:
-    setup_args['install_requires'] = ['twisted >= 2.0.0']
+    setup_args['install_requires'] = [
+        'twisted >= 2.0.0',
+        'Jinja2'
+    ]
     entry_points={
         'console_scripts': [
             'buildbot = buildbot.scripts.runner:run'],

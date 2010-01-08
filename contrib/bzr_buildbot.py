@@ -209,7 +209,7 @@ if DEFINE_POLLER:
         compare_attrs = ['url']
 
         def __init__(self, url, poll_interval=10*60, blame_merge_author=False,
-                     branch_name=None):
+                     branch_name=None, category=None):
             # poll_interval is in seconds, so default poll_interval is 10
             # minutes.
             # bzr+ssh://bazaar.launchpad.net/~launchpad-pqm/launchpad/devel/
@@ -221,19 +221,34 @@ if DEFINE_POLLER:
             self.loop = twisted.internet.task.LoopingCall(self.poll)
             self.blame_merge_author = blame_merge_author
             self.branch_name = branch_name
+            self.category = category
 
         def startService(self):
             twisted.python.log.msg("BzrPoller(%s) starting" % self.url)
             buildbot.changes.base.ChangeSource.startService(self)
-            twisted.internet.reactor.callWhenRunning(
-                self.loop.start, self.poll_interval)
+            if self.branch_name is FULL:
+                ourbranch = self.url
+            elif self.branch_name is SHORT:
+                # We are in a bit of trouble, as we cannot really know what our
+                # branch is until we have polled new changes.
+                # Seems we would have to wait until we polled the first time,
+                # and only then do the filtering, grabbing the branch name from
+                # whatever we polled.
+                # For now, leave it as it was previously (compare against
+                # self.url); at least now things work when specifying the
+                # branch name explicitly.
+                ourbranch = self.url
+            else:
+                ourbranch = self.branch_name
             for change in reversed(self.parent.changes):
-                if change.branch == self.url:
+                if change.branch == ourbranch:
                     self.last_revision = change.revision
                     break
             else:
                 self.last_revision = None
             self.polling = False
+            twisted.internet.reactor.callWhenRunning(
+                self.loop.start, self.poll_interval)
 
         def stopService(self):
             twisted.python.log.msg("BzrPoller(%s) shutting down" % self.url)
@@ -283,6 +298,7 @@ if DEFINE_POLLER:
             if (self.last_revision is None or
                 change['revision'] > self.last_revision):
                 change['branch'] = branch_name
+                change['category'] = self.category
                 changes.append(change)
                 if self.last_revision is not None:
                     while self.last_revision + 1 < change['revision']:

@@ -195,8 +195,8 @@ class RunMixin:
         log.msg("doing shutdownAllSlaves")
         dl = []
         for slave in self.slaves.values():
+            slave.stopService()
             dl.append(slave.waitUntilDisconnected())
-            dl.append(defer.maybeDeferred(slave.stopService))
         d = defer.DeferredList(dl)
         d.addCallback(self._shutdownAllSlavesDone)
         return d
@@ -222,15 +222,15 @@ class RunMixin:
     def _shutdownSlave_done(self, res, slavename):
         del self.slaves[slavename]
 
-    def killSlave(self):
+    def killSlave(self, slavename="bot1", buildername="dummy"):
         # the slave has died, its host sent a FIN. The .notifyOnDisconnect
         # callbacks will terminate the current step, so the build should be
         # flunked (no further steps should be started).
-        self.slaves['bot1'].bf.continueTrying = 0
-        bot = self.slaves['bot1'].getServiceNamed("bot")
-        broker = bot.builders["dummy"].remote.broker
+        self.slaves[slavename].bf.continueTrying = 0
+        bot = self.slaves[slavename].getServiceNamed("bot")
+        broker = bot.builders[buildername].remote.broker
         broker.transport.loseConnection()
-        del self.slaves['bot1']
+        del self.slaves[slavename]
 
     def disappearSlave(self, slavename="bot1", buildername="dummy",
                        allowReconnect=False):
@@ -287,7 +287,7 @@ def makeBuildStep(basedir, step_class=BuildStep, **kwargs):
 
     ss = SourceStamp()
     setup = {'name': "builder1", "slavename": "bot1",
-             'builddir': "builddir", 'factory': None}
+             'builddir': "builddir", 'slavebuilddir': "slavebuilddir", 'factory': None}
     b0 = Builder(setup, bss.getBuild().getBuilder())
     b0.botmaster = FakeBotMaster()
     br = BuildRequest("reason", ss, 'test_builder')

@@ -2,7 +2,6 @@
 
 import os
 import sys
-import StringIO
 import textwrap
 
 from twisted.trial import unittest
@@ -92,9 +91,9 @@ class Image:
         return Stub(name='reservation',
                     instances=[Instance(self.data, self.id, **kwargs)])
 
-    def create(klass, data, ami, owner, location):
+    def create(cls, data, ami, owner, location):
         assert ami not in data.images
-        self = klass(data, ami, owner, location)
+        self = cls(data, ami, owner, location)
         data.images[ami] = self
         return self
     create = classmethod(create)
@@ -163,8 +162,8 @@ class Key:
     #    self.raw.write_private_key(f)
     #    self.material = f.getvalue()
 
-    def create(klass, name, keys):
-        self = klass()
+    def create(cls, name, keys):
+        self = cls()
         self.name = name
         self.keys = keys
         assert name not in keys
@@ -258,7 +257,7 @@ class Mixin(RunMixin):
     def tearDown(self):
         try:
             import boto
-            import boto.exception
+            import boto.exception #@UnusedImport
         except ImportError:
             pass
         else:
@@ -271,6 +270,7 @@ class BasicConfig(Mixin, unittest.TestCase):
         from buildbot.process import factory
         from buildbot.steps import dummy
         from buildbot.ec2buildslave import EC2LatentBuildSlave
+        from buildbot.config import BuilderConfig
         s = factory.s
 
         BuildmasterConfig = c = {}
@@ -286,9 +286,8 @@ class BasicConfig(Mixin, unittest.TestCase):
         f1 = factory.BuildFactory([s(dummy.RemoteDummy, timeout=1)])
 
         c['builders'] = [
-            {'name': 'b1', 'slavenames': ['bot1'],
-             'builddir': 'b1', 'factory': f1},
-            ]
+            BuilderConfig(name='b1', slavename='bot1', factory=f1),
+        ]
         """)
 
     def testSequence(self):
@@ -354,6 +353,7 @@ class ElasticIP(Mixin, unittest.TestCase):
         from buildbot.process import factory
         from buildbot.steps import dummy
         from buildbot.ec2buildslave import EC2LatentBuildSlave
+        from buildbot.config import BuilderConfig
         s = factory.s
 
         BuildmasterConfig = c = {}
@@ -370,9 +370,8 @@ class ElasticIP(Mixin, unittest.TestCase):
         f1 = factory.BuildFactory([s(dummy.RemoteDummy, timeout=1)])
 
         c['builders'] = [
-            {'name': 'b1', 'slavenames': ['bot1'],
-             'builddir': 'b1', 'factory': f1},
-            ]
+            BuilderConfig(name='b1', slavename='bot1', factory=f1),
+        ]
         """)
 
     def testSequence(self):
@@ -416,7 +415,11 @@ class Initialization(Mixin, unittest.TestCase):
 
     def testDefaultSeparateFile(self):
         # set up .ec2/aws_id
-        home = os.environ['HOME']
+        for h in ['HOME', 'USERPROFILE']:
+            if h in os.environ:
+                home = os.environ[h]
+                break
+
         fake_home = os.path.join(os.getcwd(), 'basedir') # see RunMixin.setUp
         os.environ['HOME'] = fake_home
         dir = os.path.join(fake_home, '.ec2')

@@ -51,7 +51,7 @@ class Scheduling(unittest.TestCase):
         # converted into the local timezone, which happens to match what
         # Nightly is going to do anyway.
         MIN=60; HOUR=60*MIN; DAY=24*3600
-        now = time.mktime((2005, 11, 15, 0, 5, 36, 1, 319, 0))
+        now = time.mktime((2005, 11, 15, 0, 5, 36, 1, 319, -1))
 
         s = scheduler.Nightly('nightly', ["a"], hour=3)
         t = s.calculateNextRunTimeFrom(now)
@@ -108,7 +108,7 @@ class Scheduling(unittest.TestCase):
         s.addChange(c3)
         
         self.failUnlessEqual(s.importantChanges, [c1,c3])
-        self.failUnlessEqual(s.unimportantChanges, [c2])
+        self.failUnlessEqual(s.allChanges, [c1,c2,c3])
         self.failUnless(s.timer)
 
         d = defer.Deferred()

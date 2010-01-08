@@ -15,6 +15,9 @@ from buildbot.status.mail import MailNotifier
 from buildbot.interfaces import IBuildSlave, ILatentBuildSlave
 from buildbot.process.properties import Properties
 
+import sys
+if sys.version_info[:3] < (2,4,0):
+    from sets import Set as set
 
 class AbstractBuildSlave(NewCredPerspective, service.MultiService):
     """This is the master-side representative for a remote buildbot slave.
@@ -194,6 +197,7 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
                 # TODO: info{} might have other keys
                 state["admin"] = info.get("admin")
                 state["host"] = info.get("host")
+                state["access_uri"] = info.get("access_uri", None)
             def _info_unavailable(why):
                 # maybe an old slave, doesn't implement remote_getSlaveInfo
                 log.msg("BuildSlave.info_unavailable")
@@ -201,6 +205,17 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
             d1.addCallbacks(_got_info, _info_unavailable)
             return d1
         d.addCallback(_get_info)
+
+        def _get_version(res):
+            d1 = bot.callRemote("getVersion")
+            def _got_version(version):
+                state["version"] = version
+            def _version_unavailable(why):
+                # probably an old slave
+                log.msg("BuildSlave.version_unavailable")
+                log.err(why)
+            d1.addCallbacks(_got_version, _version_unavailable)
+        d.addCallback(_get_version)
 
         def _get_commands(res):
             d1 = bot.callRemote("getCommands")
@@ -219,6 +234,8 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
         def _accept_slave(res):
             self.slave_status.setAdmin(state.get("admin"))
             self.slave_status.setHost(state.get("host"))
+            self.slave_status.setAccessURI(state.get("access_uri"))
+            self.slave_status.setVersion(state.get("version"))
             self.slave_status.setConnected(True)
             self.slave_commands = state.get("slave_commands")
             self.slave = bot
@@ -306,7 +323,7 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
 
     def sendBuilderList(self):
         our_builders = self.botmaster.getBuildersForSlave(self.slavename)
-        blist = [(b.name, b.builddir) for b in our_builders]
+        blist = [(b.name, b.slavebuilddir) for b in our_builders]
         d = self.slave.callRemote("setBuilderList", blist)
         return d
 
@@ -314,12 +331,6 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
         pass
 
     def addSlaveBuilder(self, sb):
-        if sb.builder_name not in self.slavebuilders:
-            log.msg("%s adding %s" % (self, sb))
-        elif sb is not self.slavebuilders[sb.builder_name]:
-            log.msg("%s replacing %s" % (self, sb))
-        else:
-            return
         self.slavebuilders[sb.builder_name] = sb
 
     def removeSlaveBuilder(self, sb):
@@ -327,8 +338,6 @@ class AbstractBuildSlave(NewCredPerspective, service.MultiService):
             del self.slavebuilders[sb.builder_name]
         except KeyError:
             pass
-        else:
-            log.msg("%s removed %s" % (self, sb))
 
     def canStartBuild(self):
         """

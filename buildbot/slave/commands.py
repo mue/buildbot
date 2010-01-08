@@ -1,7 +1,8 @@
 # -*- test-case-name: buildbot.test.test_slavecommand -*-
 
-import os, sys, re, signal, shutil, types, time
+import os, sys, re, signal, shutil, types, time, tarfile, tempfile
 from stat import ST_CTIME, ST_MTIME, ST_SIZE
+from xml.dom.minidom import parseString
 
 from zope.interface import implements
 from twisted.internet.protocol import ProcessProtocol
@@ -11,11 +12,12 @@ from twisted.python.procutils import which
 
 from buildbot.slave.interfaces import ISlaveCommand
 from buildbot.slave.registry import registerSlaveCommand
+from buildbot.util import to_text, remove_userpassword
 
 # this used to be a CVS $-style "Revision" auto-updated keyword, but since I
 # moved to Darcs as the primary repository, this is updated manually each
 # time this file is changed. The last cvs_ver that was here was 1.51 .
-command_version = "2.8"
+command_version = "2.9"
 
 # version history:
 #  >=1.17: commands are interruptable
@@ -40,6 +42,7 @@ command_version = "2.8"
 #  >= 2.6: added uploadDirectory
 #  >= 2.7: added usePTY option to SlaveShellCommand
 #  >= 2.8: added username and password args to SVN class
+#  >= 2.9: add depth arg to SVN class
 
 class CommandInterrupted(Exception):
     pass
@@ -66,7 +69,7 @@ class Obfuscated:
                 if isinstance(elt, Obfuscated):
                     rv.append(elt.real)
                 else:
-                    rv.append(elt)
+                    rv.append(to_text(elt))
         return rv
     get_real = staticmethod(get_real)
 
@@ -78,7 +81,7 @@ class Obfuscated:
                 if isinstance(elt, Obfuscated):
                     rv.append(elt.fake)
                 else:
-                    rv.append(elt)
+                    rv.append(to_text(elt))
         return rv
     get_fake = staticmethod(get_fake)
 
@@ -124,7 +127,8 @@ def rmdirRecursive(dir):
         if os.path.isdir(full_name):
             rmdirRecursive(full_name)
         else:
-            os.chmod(full_name, 0700)
+            if os.path.isfile(full_name):
+                os.chmod(full_name, 0700)
             os.remove(full_name)
     os.rmdir(dir)
 
@@ -199,16 +203,21 @@ class ShellCommandPP(ProcessProtocol):
 class LogFileWatcher:
     POLL_INTERVAL = 2
 
-    def __init__(self, command, name, logfile):
+    def __init__(self, command, name, logfile, follow=False):
         self.command = command
         self.name = name
         self.logfile = logfile
+
         log.msg("LogFileWatcher created to watch %s" % logfile)
         # we are created before the ShellCommand starts. If the logfile we're
         # supposed to be watching already exists, record its size and
         # ctime/mtime so we can tell when it starts to change.
         self.old_logfile_stats = self.statFile()
         self.started = False
+
+        # follow the file, only sending back lines
+        # added since we started watching
+        self.follow = follow
 
         # every 2 seconds we check on the file again
         self.poller = task.LoopingCall(self.poll)
@@ -245,6 +254,11 @@ class LogFileWatcher:
                 self.old_logfile_stats = None
                 return # no file to work with
             self.f = open(self.logfile, "rb")
+            # if we only want new lines, seek to
+            # where we stat'd so we only find new
+            # lines
+            if self.follow:
+                self.f.seek(s[2], 0)
             self.started = True
         self.f.seek(self.f.tell(), 0)
         while True:
@@ -274,9 +288,9 @@ class ShellCommand:
     def __init__(self, builder, command,
                  workdir, environ=None,
                  sendStdout=True, sendStderr=True, sendRC=True,
-                 timeout=None, initialStdin=None, keepStdinOpen=False,
-                 keepStdout=False, keepStderr=False, logEnviron=True,
-                 logfiles={}, usePTY="slave-config"):
+                 timeout=None, maxTime=None, initialStdin=None,
+                 keepStdinOpen=False, keepStdout=False, keepStderr=False,
+                 logEnviron=True, logfiles={}, usePTY="slave-config"):
         """
 
         @param keepStdout: if True, we keep a copy of all the stdout text
@@ -297,6 +311,8 @@ class ShellCommand:
         self.sendRC = sendRC
         self.logfiles = logfiles
         self.workdir = workdir
+        if not os.path.exists(workdir):
+            os.makedirs(workdir)
         self.environ = os.environ.copy()
         if environ:
             if environ.has_key('PYTHONPATH'):
@@ -323,6 +339,8 @@ class ShellCommand:
         self.logEnviron = logEnviron
         self.timeout = timeout
         self.timer = None
+        self.maxTime = maxTime
+        self.maxTimer = None
         self.keepStdout = keepStdout
         self.keepStderr = keepStderr
 
@@ -342,9 +360,19 @@ class ShellCommand:
             self.usePTY = False
 
         self.logFileWatchers = []
-        for name,filename in self.logfiles.items():
+        for name,filevalue in self.logfiles.items():
+            filename = filevalue
+            follow = False
+
+            # check for a dictionary of options
+            # filename is required, others are optional
+            if type(filevalue) == dict:
+                filename = filevalue['filename']
+                follow = filevalue.get('follow', False)
+
             w = LogFileWatcher(self, name,
-                               os.path.join(self.workdir, filename))
+                               os.path.join(self.workdir, filename),
+                               follow=follow)
             self.logFileWatchers.append(w)
 
     def __repr__(self):
@@ -495,6 +523,9 @@ class ShellCommand:
         if self.timeout:
             self.timer = reactor.callLater(self.timeout, self.doTimeout)
 
+        if self.maxTime:
+            self.maxTimer = reactor.callLater(self.maxTime, self.doMaxTimeout)
+
         for w in self.logFileWatchers:
             w.start()
 
@@ -534,7 +565,7 @@ class ShellCommand:
         self.elapsedTime = time.time() - self.startTime
         log.msg("command finished with signal %s, exit code %s, elapsedTime: %0.6f" % (sig,rc,self.elapsedTime))
         for w in self.logFileWatchers:
-             # this will send the final updates
+            # this will send the final updates
             w.stop()
         if sig is not None:
             rc = -1
@@ -547,6 +578,9 @@ class ShellCommand:
         if self.timer:
             self.timer.cancel()
             self.timer = None
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
         d = self.deferred
         self.deferred = None
         if d:
@@ -559,6 +593,9 @@ class ShellCommand:
         if self.timer:
             self.timer.cancel()
             self.timer = None
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
         d = self.deferred
         self.deferred = None
         if d:
@@ -571,14 +608,22 @@ class ShellCommand:
         msg = "command timed out: %d seconds without output" % self.timeout
         self.kill(msg)
 
+    def doMaxTimeout(self):
+        self.maxTimer = None
+        msg = "command timed out: %d seconds elapsed" % self.maxTime
+        self.kill(msg)
+
     def kill(self, msg):
         # This may be called by the timeout, or when the user has decided to
         # abort this build.
         if self.timer:
             self.timer.cancel()
             self.timer = None
-        if hasattr(self.process, "pid"):
-            msg += ", killing pid %d" % self.process.pid
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
+        if hasattr(self.process, "pid") and self.process.pid is not None:
+            msg += ", killing pid %s" % self.process.pid
         log.msg(msg)
         self.sendStatus({'header': "\n" + msg + "\n"})
 
@@ -604,6 +649,8 @@ class ShellCommand:
                     log.msg("signal module is missing SIG%s" % self.KILL)
                 elif not hasattr(os, "kill"):
                     log.msg("os module is missing the 'kill' function")
+                elif not hasattr(self.process, "pid") or self.process.pid is None:
+                    log.msg("self.process has no pid")
                 else:
                     log.msg("trying os.kill(-pid, %d)" % (sig,))
                     # TODO: maybe use os.killpg instead of a negative pid?
@@ -916,7 +963,7 @@ class SlaveFileUploadCommand(Command):
 registerSlaveCommand("uploadFile", SlaveFileUploadCommand, command_version)
 
 
-class SlaveDirectoryUploadCommand(Command):
+class SlaveDirectoryUploadCommand(SlaveFileUploadCommand):
     """
     Upload a directory from slave to build master
     Arguments:
@@ -926,6 +973,7 @@ class SlaveDirectoryUploadCommand(Command):
         - ['writer']:    RemoteReference to a transfer._DirectoryWriter object
         - ['maxsize']:   max size (in bytes) of file to write
         - ['blocksize']: max size for each data block
+        - ['compress']:  one of [None, 'bz2', 'gz']
     """
     debug = True
 
@@ -935,6 +983,7 @@ class SlaveDirectoryUploadCommand(Command):
         self.writer = args['writer']
         self.remaining = args['maxsize']
         self.blocksize = args['blocksize']
+        self.compress = args['compress']
         self.stderr = None
         self.rc = 0
 
@@ -942,63 +991,46 @@ class SlaveDirectoryUploadCommand(Command):
         if self.debug:
             log.msg('SlaveDirectoryUploadCommand started')
 
-        # create some lists with all files and directories
-        foundFiles = []
-        foundDirs = []
-
-        self.baseRoot = os.path.join(self.builder.basedir,
-                                     self.workdir,
-                                     os.path.expanduser(self.dirname))
+        self.path = os.path.join(self.builder.basedir,
+                                 self.workdir,
+                                 os.path.expanduser(self.dirname))
         if self.debug:
-            log.msg("baseRoot: %r" % self.baseRoot)
+            log.msg("path: %r" % self.path)
 
-        for root, dirs, files in os.walk(self.baseRoot):
-            tempRoot = root
-            relRoot = ''
-            while (tempRoot != self.baseRoot):
-                tempRoot, tempRelRoot = os.path.split(tempRoot)
-                relRoot = os.path.join(tempRelRoot, relRoot)
-            for name in files:
-                foundFiles.append(os.path.join(relRoot, name))
-            for directory in dirs:
-                foundDirs.append(os.path.join(relRoot, directory))
+        # Create temporary archive
+        fd, self.tarname = tempfile.mkstemp()
+        fileobj = os.fdopen(fd, 'w')
+        if self.compress == 'bz2':
+            mode='w|bz2'
+        elif self.compress == 'gz':
+            mode='w|gz'
+        else:
+            mode = 'w'
+        archive = tarfile.open(name=self.tarname, mode=mode, fileobj=fileobj)
+        archive.add(self.path, '')
+        archive.close()
+        fileobj.close()
 
-        if self.debug:
-            log.msg("foundDirs: %s" % (str(foundDirs)))
-            log.msg("foundFiles: %s" % (str(foundFiles)))
+        # Transfer it
+        self.fp = open(self.tarname, 'rb')
 
-        # create all directories on the master, to catch also empty ones
-        for dirname in foundDirs:
-            dirname = dirname.split(os.path.sep)
-            self.writer.callRemote("createdir", dirname)
+        self.sendStatus({'header': "sending %s" % self.path})
 
-        for filename in foundFiles:
-            self._writeFile(filename)
-
-        return None
-
-    def _writeFile(self, filename):
-        """Write a file to the remote writer"""
-
-        log.msg("_writeFile: %r" % (filename))
-        self.writer.callRemote('open', filename.split(os.path.sep))
-        data = open(os.path.join(self.baseRoot, filename), "r").read()
-        self.writer.callRemote('write', data)
-        self.writer.callRemote('close')
-        return None
-
-    def interrupt(self):
-        if self.debug:
-            log.msg('interrupted')
-        if self.interrupted:
-            return
-        if self.stderr is None:
-            self.stderr = 'Upload of %r interrupted' % self.path
-            self.rc = 1
-        self.interrupted = True
-        # the next _writeBlock call will notice the .interrupted flag
+        d = defer.Deferred()
+        reactor.callLater(0, self._loop, d)
+        def unpack(res):
+            # unpack the archive, but pass through any errors from _loop
+            d1 = self.writer.callRemote("unpack")
+            d1.addErrback(log.err)
+            d1.addCallback(lambda ignored: res)
+            return d1
+        d.addCallback(unpack)
+        d.addBoth(self.finished)
+        return d
 
     def finished(self, res):
+        self.fp.close()
+        os.remove(self.tarname)
         if self.debug:
             log.msg('finished: stderr=%r, rc=%r' % (self.stderr, self.rc))
         if self.stderr is None:
@@ -1182,10 +1214,12 @@ class SlaveShellCommand(Command):
                       configuration of the slave)
         - ['not_really']: 1 to skip execution and return rc=0
         - ['timeout']: seconds of silence to tolerate before killing command
+        - ['maxTime']: seconds before killing command
         - ['logfiles']: dict mapping LogFile name to the workdir-relative
                         filename of a local log file. This local file will be
                         watched just like 'tail -f', and all changes will be
                         written to 'log' status updates.
+        - ['logEnviron']: False to not log the environment variables on the slave
 
     ShellCommand creates the following status messages:
         - {'stdout': data} : when stdout data is available
@@ -1204,6 +1238,7 @@ class SlaveShellCommand(Command):
         c = ShellCommand(self.builder, args['command'],
                          workdir, environ=args.get('env'),
                          timeout=args.get('timeout', None),
+                         maxTime=args.get('maxTime', None),
                          sendStdout=args.get('want_stdout', True),
                          sendStderr=args.get('want_stderr', True),
                          sendRC=True,
@@ -1211,6 +1246,7 @@ class SlaveShellCommand(Command):
                          keepStdinOpen=args.get('keep_stdin_open'),
                          logfiles=args.get('logfiles', {}),
                          usePTY=args.get('usePTY', "slave-config"),
+                         logEnviron=args.get('logEnviron', True),
                          )
         self.command = c
         d = self.command.start()
@@ -1345,6 +1381,8 @@ class SourceBase(Command):
         - ['timeout']:  seconds of silence tolerated before we kill off the
                         command
 
+        - ['maxTime']:  seconds before we kill off the command
+
         - ['retry']:    If not None, this is a tuple of (delay, repeats)
                         which means that any failed VC updates should be
                         reattempted, up to REPEATS times, after a delay of
@@ -1366,6 +1404,7 @@ class SourceBase(Command):
         self.revision = args.get('revision')
         self.patch = args.get('patch')
         self.timeout = args.get('timeout', 120)
+        self.maxTime = args.get('maxTime', None)
         self.retry = args.get('retry')
         # VC-specific subclasses should override this to extract more args.
         # Make sure to upcall!
@@ -1426,12 +1465,17 @@ class SourceBase(Command):
 
     def sourcedataMatches(self):
         try:
-            olddata = open(self.sourcedatafile, "r").read()
+            olddata = self.readSourcedata()
             if olddata != self.sourcedata:
                 return False
         except IOError:
             return False
         return True
+
+    def sourcedirIsPatched(self):
+        return os.path.exists(os.path.join(self.builder.basedir,
+                                           self.workdir,
+                                           ".buildbot-patched"))
 
     def _handleGotRevision(self, res):
         d = defer.maybeDeferred(self.parseGotRevision)
@@ -1455,17 +1499,23 @@ class SourceBase(Command):
 
         return None
 
+    def readSourcedata(self):
+        return open(self.sourcedatafile, "r").read()
+
     def writeSourcedata(self, res):
         open(self.sourcedatafile, "w").write(self.sourcedata)
         return res
 
     def sourcedirIsUpdateable(self):
+        """Returns True if the tree can be updated."""
         raise NotImplementedError("this must be implemented in a subclass")
 
     def doVCUpdate(self):
+        """Returns a deferred with the steps to update a checkout."""
         raise NotImplementedError("this must be implemented in a subclass")
 
     def doVCFull(self):
+        """Returns a deferred with the steps to do a fresh checkout."""
         raise NotImplementedError("this must be implemented in a subclass")
 
     def maybeDoVCFallback(self, rc):
@@ -1525,7 +1575,7 @@ class SourceBase(Command):
                 return d
         return res
 
-    def doClobber(self, dummy, dirname):
+    def doClobber(self, dummy, dirname, chmodDone=False):
         # TODO: remove the old tree in the background
 ##         workdir = os.path.join(self.builder.basedir, self.workdir)
 ##         deaddir = self.workdir + ".deleting"
@@ -1552,14 +1602,37 @@ class SourceBase(Command):
             return defer.succeed(0)
         command = ["rm", "-rf", d]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=0, timeout=self.timeout, usePTY=False)
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         usePTY=False)
 
         self.command = c
         # sendRC=0 means the rm command will send stdout/stderr to the
         # master, but not the rc=0 when it finishes. That job is left to
         # _sendRC
         d = c.start()
+        # The rm -rf may fail if there is a left-over subdir with chmod 000
+        # permissions. So if we get a failure, we attempt to chmod suitable
+        # permissions and re-try the rm -rf.
+        if chmodDone:
+            d.addCallback(self._abandonOnFailure)
+        else:
+            d.addCallback(lambda rc: self.doClobberTryChmodIfFail(rc, dirname))
+        return d
+
+    def doClobberTryChmodIfFail(self, rc, dirname):
+        assert isinstance(rc, int)
+        if rc == 0:
+            return defer.succeed(0)
+        # Attempt a recursive chmod and re-try the rm -rf after.
+        command = ["chmod", "-R", "u+rwx", os.path.join(self.builder.basedir, dirname)]
+        c = ShellCommand(self.builder, command, self.builder.basedir,
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         usePTY=False)
+
+        self.command = c
+        d = c.start()
         d.addCallback(self._abandonOnFailure)
+        d.addCallback(lambda dummy: self.doClobber(dummy, dirname, True))
         return d
 
     def doCopy(self, res):
@@ -1582,26 +1655,140 @@ class SourceBase(Command):
 
         command = ['cp', '-R', '-P', '-p', fromdir, todir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout, maxTime=self.maxTime,
+                         usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
         return d
 
     def doPatch(self, res):
-        patchlevel, diff = self.patch
-        command = [getCommand("patch"), '-p%d' % patchlevel]
+        patchlevel = self.patch[0]
+        diff = self.patch[1]
+        root = None
+        if len(self.patch) >= 3:
+            root = self.patch[2]
+        command = [
+            getCommand("patch"),
+            '-p%d' % patchlevel,
+            '--remove-empty-files',
+            '--force',
+            '--forward',
+        ]
         dir = os.path.join(self.builder.basedir, self.workdir)
-        # mark the directory so we don't try to update it later
-        open(os.path.join(dir, ".buildbot-patched"), "w").write("patched\n")
+        # Mark the directory so we don't try to update it later, or at least try
+        # to revert first.
+        marker = open(os.path.join(dir, ".buildbot-patched"), "w")
+        marker.write("patched\n")
+        marker.close()
+
+        # Update 'dir' with the 'root' option. Make sure it is a subdirectory
+        # of dir.
+        if (root and
+            os.path.abspath(os.path.join(dir, root)
+                            ).startswith(os.path.abspath(dir))):
+            dir = os.path.join(dir, root)
+
         # now apply the patch
         c = ShellCommand(self.builder, command, dir,
                          sendRC=False, timeout=self.timeout,
-                         initialStdin=diff, usePTY=False)
+                         maxTime=self.maxTime, initialStdin=diff, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
         return d
+
+
+
+class BK(SourceBase):
+    """BitKeeper-specific VC operation. In addition to the arguments
+    handled by SourceBase, this command reads the following keys:
+
+    ['bkurl'] (required): the BK repository string
+    """
+
+    header = "bk operation"
+
+    def setup(self, args):
+        SourceBase.setup(self, args)
+        self.vcexe = getCommand("bk")
+        self.bkurl = args['bkurl']
+        self.sourcedata = '"%s\n"' % self.bkurl
+
+        self.bk_args = []
+        if args.get('extra_args', None) is not None:
+            self.bk_args.extend(args['extra_args'])
+
+    def sourcedirIsUpdateable(self):
+        if os.path.exists(os.path.join(self.builder.basedir,
+                                       self.srcdir, ".buildbot-patched")):
+            return False
+        return os.path.isfile(os.path.join(self.builder.basedir,
+                                          self.srcdir, "BK/parent"))
+
+    def doVCUpdate(self):
+        revision = self.args['revision'] or 'HEAD'
+        # update: possible for mode in ('copy', 'update')
+        d = os.path.join(self.builder.basedir, self.srcdir)
+
+        # Revision is ignored since the BK free client doesn't support it.
+        command = [self.vcexe, 'pull']
+        c = ShellCommand(self.builder, command, d,
+                         sendRC=False, timeout=self.timeout,
+                         keepStdout=True, usePTY=False)
+        self.command = c
+        return c.start()
+
+    def doVCFull(self):
+
+        revision_arg = ''
+        if self.args['revision']:
+             revision_arg = "-r%s" % self.args['revision']
+
+        d = self.builder.basedir
+
+        command = [self.vcexe, 'clone', revision_arg] + self.bk_args + \
+                   [self.bkurl, self.srcdir]
+        c = ShellCommand(self.builder, command, d,
+                         sendRC=False, timeout=self.timeout,
+                         keepStdout=True, usePTY=False)
+        self.command = c
+        return c.start()
+
+    def getBKVersionCommand(self):
+        """
+        Get the (shell) command used to determine BK revision number
+        of checked-out code
+
+        return: list of strings, passable as the command argument to ShellCommand
+        """
+        return [self.vcexe, "changes", "-r+", "-d:REV:"]
+
+    def parseGotRevision(self):
+        c = ShellCommand(self.builder,
+                         self.getBKVersionCommand(),
+                         os.path.join(self.builder.basedir, self.srcdir),
+                         environ=self.env,
+                         sendStdout=False, sendStderr=False, sendRC=False,
+                         keepStdout=True, usePTY=False)
+        d = c.start()
+        def _parse(res):
+            r_raw = c.stdout.strip()
+            got_version = None
+            try:
+                r = r_raw
+            except:
+                msg = ("BK.parseGotRevision unable to parse output: (%s)" % r_raw)
+                log.msg(msg)
+                self.sendStatus({'header': msg + "\n"})
+                raise ValueError(msg)
+            return r
+        d.addCallback(_parse)
+        return d
+
+registerSlaveCommand("bk", BK, command_version)
+
+
 
 
 class CVS(SourceBase):
@@ -1613,6 +1800,8 @@ class CVS(SourceBase):
     ['branch']: a '-r' tag or branch name to use for the checkout/update
     ['login']: a string for use as a password to 'cvs login'
     ['global_options']: a list of strings to use before the CVS verb
+    ['checkout_options']: a list of strings to use after checkout,
+                          but before revision and branch specifiers
     """
 
     header = "cvs operation"
@@ -1623,17 +1812,16 @@ class CVS(SourceBase):
         self.cvsroot = args['cvsroot']
         self.cvsmodule = args['cvsmodule']
         self.global_options = args.get('global_options', [])
+        self.checkout_options = args.get('checkout_options', [])
         self.branch = args.get('branch')
         self.login = args.get('login')
         self.sourcedata = "%s\n%s\n%s\n" % (self.cvsroot, self.cvsmodule,
                                             self.branch)
 
     def sourcedirIsUpdateable(self):
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
-        return os.path.isdir(os.path.join(self.builder.basedir,
-                                          self.srcdir, "CVS"))
+        return (not self.sourcedirIsPatched() and
+                os.path.isdir(os.path.join(self.builder.basedir,
+                                           self.srcdir, "CVS")))
 
     def start(self):
         if self.login is not None:
@@ -1643,6 +1831,7 @@ class CVS(SourceBase):
                        + ['login'])
             c = ShellCommand(self.builder, command, d,
                              sendRC=False, timeout=self.timeout,
+                             maxTime=self.maxTime,
                              initialStdin=self.login+"\n", usePTY=False)
             self.command = c
             d = c.start()
@@ -1664,7 +1853,8 @@ class CVS(SourceBase):
         if self.revision:
             command += ['-D', self.revision]
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1677,13 +1867,18 @@ class CVS(SourceBase):
         command = ([self.vcexe, '-d', self.cvsroot, '-z3'] +
                    self.global_options +
                    [verb, '-d', self.srcdir])
+
+        if verb == "checkout":
+            command += self.checkout_options
         if self.branch:
             command += ['-r', self.branch]
         if self.revision:
             command += ['-D', self.revision]
         command += [self.cvsmodule]
+
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1701,8 +1896,12 @@ class SVN(SourceBase):
     handled by SourceBase, this command reads the following keys:
 
     ['svnurl'] (required): the SVN repository string
-    ['username']    Username passed to the svn command
-    ['password']    Password passed to the svn command
+    ['username']:          Username passed to the svn command
+    ['password']:          Password passed to the svn command
+    ['keep_on_purge']:     Files and directories to keep between updates
+    ['ignore_ignores']:    Ignore ignores when purging changes
+    ['always_purge']:      Always purge local changes after each build
+    ['depth']:     	   Pass depth argument to subversion 1.5+ 
     """
 
     header = "svn operation"
@@ -1712,55 +1911,90 @@ class SVN(SourceBase):
         self.vcexe = getCommand("svn")
         self.svnurl = args['svnurl']
         self.sourcedata = "%s\n" % self.svnurl
+        self.keep_on_purge = args.get('keep_on_purge', [])
+        self.keep_on_purge.append(".buildbot-sourcedata")
+        self.ignore_ignores = args.get('ignore_ignores', True)
+        self.always_purge = args.get('always_purge', False)
 
-        self.extra_args = []
+        self.svn_args = []
         if args.has_key('username'):
-            self.extra_args.extend(["--username", args['username']])
+            self.svn_args.extend(["--username", args['username']])
         if args.has_key('password'):
-            self.extra_args.extend(["--password", Obfuscated(args['password'], "XXXX")])
+            self.svn_args.extend(["--password", Obfuscated(args['password'], "XXXX")])
+        if args.get('extra_args', None) is not None:
+            self.svn_args.extend(args['extra_args'])
+
+        if args.has_key('depth'):
+            self.svn_args.extend(["--depth",args['depth']])
+
+    def _dovccmd(self, command, args, rootdir=None, cb=None, **kwargs):
+        if rootdir is None:
+            rootdir = os.path.join(self.builder.basedir, self.srcdir)
+        fullCmd = [self.vcexe, command, '--non-interactive', '--no-auth-cache']
+        fullCmd.extend(self.svn_args)
+        fullCmd.extend(args)
+        c = ShellCommand(self.builder, fullCmd, rootdir,
+                         environ=self.env, sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False, **kwargs)
+        self.command = c
+        d = c.start()
+        if cb:
+            d.addCallback(self._abandonOnFailure)
+            d.addCallback(cb)
+        return d
 
     def sourcedirIsUpdateable(self):
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
         return os.path.isdir(os.path.join(self.builder.basedir,
                                           self.srcdir, ".svn"))
 
     def doVCUpdate(self):
+        if self.sourcedirIsPatched() or self.always_purge:
+            return self._purgeAndUpdate()
         revision = self.args['revision'] or 'HEAD'
         # update: possible for mode in ('copy', 'update')
-        d = os.path.join(self.builder.basedir, self.srcdir)
-        command = [self.vcexe, 'update'] + \
-                    self.extra_args + \
-                    ['--revision', str(revision),
-                   '--non-interactive', '--no-auth-cache']
-        c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
-        self.command = c
-        return c.start()
+        return self._dovccmd('update', ['--revision', str(revision)],
+                             keepStdout=True)
 
     def doVCFull(self):
         revision = self.args['revision'] or 'HEAD'
-        d = self.builder.basedir
+        args = ['--revision', str(revision), self.svnurl, self.srcdir]
         if self.mode == "export":
-            command = [self.vcexe, 'export'] + \
-                        self.extra_args + \
-                        ['--revision', str(revision),
-                        '--non-interactive', '--no-auth-cache',
-                        self.svnurl, self.srcdir]
+            command = 'export'
         else:
             # mode=='clobber', or copy/update on a broken workspace
-            command = [self.vcexe, 'checkout'] + \
-                        self.extra_args + \
-                        ['--revision', str(revision),
-                        '--non-interactive', '--no-auth-cache',
-                        self.svnurl, self.srcdir]
-        c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
-        self.command = c
-        return c.start()
+            command = 'checkout'
+        return self._dovccmd(command, args, rootdir=self.builder.basedir,
+                             keepStdout=True)
+
+    def _purgeAndUpdate(self):
+        """svn revert has several corner cases that make it unpractical.
+
+        Use the Force instead and delete everything that shows up in status."""
+        args = ['--xml']
+        if self.ignore_ignores:
+            args.append('--no-ignore')
+        return self._dovccmd('status', args, keepStdout=True, sendStdout=False,
+                             cb=self._purgeAndUpdate2)
+
+    def _purgeAndUpdate2(self, res):
+        """Delete everything that shown up on status."""
+        result_xml = parseString(self.command.stdout)
+        for entry in result_xml.getElementsByTagName('entry'):
+            filename = entry.getAttribute('path')
+            if filename in self.keep_on_purge:
+                continue
+            filepath = os.path.join(self.builder.basedir, self.workdir,
+                                    filename)
+            self.sendStatus({'stdout': "%s\n" % filepath})
+            if os.path.isfile(filepath):
+                os.chmod(filepath, 0700)
+                os.remove(filepath)
+            else:
+                rmdirRecursive(filepath)
+        # Now safe to update.
+        revision = self.args['revision'] or 'HEAD'
+        return self._dovccmd('update', ['--revision', str(revision)],
+                             keepStdout=True)
 
     def getSvnVersionCommand(self):
         """
@@ -1822,14 +2056,11 @@ class Darcs(SourceBase):
         self.revision = self.args.get('revision')
 
     def sourcedirIsUpdateable(self):
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
-        if self.revision:
-            # checking out a specific revision requires a full 'darcs get'
-            return False
-        return os.path.isdir(os.path.join(self.builder.basedir,
-                                          self.srcdir, "_darcs"))
+        # checking out a specific revision requires a full 'darcs get'
+        return (not self.revision and
+                not self.sourcedirIsPatched() and
+                os.path.isdir(os.path.join(self.builder.basedir,
+                                           self.srcdir, "_darcs")))
 
     def doVCUpdate(self):
         assert not self.revision
@@ -1837,7 +2068,8 @@ class Darcs(SourceBase):
         d = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'pull', '--all', '--verbose']
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1858,7 +2090,8 @@ class Darcs(SourceBase):
         command.append(self.repourl)
 
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         if self.revision:
@@ -1915,11 +2148,9 @@ class Monotone(SourceBase):
 
     def sourcedirIsUpdateable(self):
         self._makefulls()
-        if os.path.exists(os.path.join(self.full_srcdir,
-                                       ".buildbot_patched")):
-            return False
-        return (os.path.isfile(self.full_db_path)
-                and os.path.isdir(os.path.join(self.full_srcdir, "MT")))
+        return (not self.sourcedirIsPatched() and
+                os.path.isfile(self.full_db_path) and
+                os.path.isdir(os.path.join(self.full_srcdir, "MT")))
 
     def doVCUpdate(self):
         return self._withFreshDb(self._doUpdate)
@@ -1930,7 +2161,8 @@ class Monotone(SourceBase):
                    "-r", self.revision,
                    "-b", self.branch]
         c = ShellCommand(self.builder, command, self.full_srcdir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1944,7 +2176,8 @@ class Monotone(SourceBase):
                    "-b", self.branch,
                    self.full_srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1965,7 +2198,8 @@ class Monotone(SourceBase):
             command = [self.monotone, "db", "init",
                        "--db=" + self.full_db_path]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -1977,7 +2211,8 @@ class Monotone(SourceBase):
         command = [self.monotone, "--db=" + self.full_db_path,
                    "pull", "--ticker=dot", self.server_addr, self.branch]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self._pull_timeout, usePTY=False)
+                         sendRC=False, timeout=self._pull_timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.sendStatus({"header": "pulling %s from %s\n"
                                    % (self.branch, self.server_addr)})
         self.command = c
@@ -1993,23 +2228,26 @@ class Git(SourceBase):
     """Git specific VC operation. In addition to the arguments
     handled by SourceBase, this command reads the following keys:
 
-    ['repourl'] (required): the upstream GIT repository string
-    ['branch'] (optional): which version (i.e. branch or tag) to
-                           retrieve. Default: "master".
+    ['repourl'] (required):    the upstream GIT repository string
+    ['branch'] (optional):     which version (i.e. branch or tag) to
+                               retrieve. Default: "master".
     ['submodules'] (optional): whether to initialize and update
-                           submodules. Default: False.
+                               submodules. Default: False.
+    ['ignore_ignores']:        ignore ignores when purging changes.
     """
 
     header = "git operation"
 
     def setup(self, args):
         SourceBase.setup(self, args)
+        self.vcexe = getCommand("git")
         self.repourl = args['repourl']
         self.branch = args.get('branch')
         if not self.branch:
             self.branch = "master"
         self.sourcedata = "%s %s\n" % (self.repourl, self.branch)
         self.submodules = args.get('submodules')
+        self.ignore_ignores = args.get('ignore_ignores', True)
 
     def _fullSrcdir(self):
         return os.path.join(self.builder.basedir, self.srcdir)
@@ -2022,8 +2260,16 @@ class Git(SourceBase):
     def sourcedirIsUpdateable(self):
         return os.path.isdir(os.path.join(self._fullSrcdir(), ".git"))
 
-    def readSourcedata(self):
-        return open(self.sourcedatafile, "r").read()
+    def _dovccmd(self, command, cb=None, **kwargs):
+        c = ShellCommand(self.builder, [self.vcexe] + command, self._fullSrcdir(),
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False, **kwargs)
+        self.command = c
+        d = c.start()
+        if cb:
+            d.addCallback(self._abandonOnFailure)
+            d.addCallback(cb)
+        return d
 
     # If the repourl matches the sourcedata file, then
     # we can say that the sourcedata matches.  We can
@@ -2039,79 +2285,92 @@ class Git(SourceBase):
             return False
         return True
 
-    def _didSubmodules(self, res):
-        command = ['git', 'submodule', 'update', '--init']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        return c.start()
+    def _cleanSubmodules(self, res):
+        command = ['submodule', 'foreach', 'git', 'clean', '-d', '-f']
+        if self.ignore_ignores:
+            command.append('-x')
+        return self._dovccmd(command)
 
+    def _updateSubmodules(self, res):
+        return self._dovccmd(['submodule', 'update'], self._cleanSubmodules)
+
+    def _initSubmodules(self, res):
+        if self.submodules:
+            return self._dovccmd(['submodule', 'init'], self._updateSubmodules)
+        else:
+            return defer.succeed(0)
+
+    def _didHeadCheckout(self, res):
+        # Rename branch, so that the repo will have the expected branch name
+        # For further information about this, see the commit message
+        command = ['branch', '-M', self.branch]
+        return self._dovccmd(command, self._initSubmodules)
+        
     def _didFetch(self, res):
         if self.revision:
             head = self.revision
         else:
             head = 'FETCH_HEAD'
 
-        command = ['git', 'reset', '--hard', head]
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        if self.submodules:
-            d.addCallback(self._abandonOnFailure)
-            d.addCallback(self._didSubmodules)
-        return d
+        # That is not sufficient. git will leave unversioned files and empty
+        # directories. Clean them up manually in _didReset.
+        command = ['reset', '--hard', head]
+        return self._dovccmd(command, self._didHeadCheckout)
 
-    # Update first runs "git clean", removing local changes, This,
-    # combined with the later "git reset" equates clobbering the repo,
+    # Update first runs "git clean", removing local changes,
+    # if the branch to be checked out has changed.  This, combined
+    # with the later "git reset" equates clobbering the repo,
     # but it's much more efficient.
     def doVCUpdate(self):
-        command = ['git', 'clean', '-f', '-d', '-x']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didClean)
-        return d
+        try:
+            # Check to see if our branch has changed
+            diffbranch = self.sourcedata != self.readSourcedata()
+        except IOError:
+            diffbranch = False
+        if diffbranch:
+            command = ['clean', '-f', '-d']
+            if self.ignore_ignores:
+                command.append('-x')
+            return self._dovccmd(command, self._didClean)
+        return self._didClean(None)
 
-    def _didClean(self, dummy):
-        command = ['git', 'fetch', '-t', self.repourl, self.branch]
+    def _doFetch(self, dummy):
+        # The plus will make sure the repo is moved to the branch's
+        # head even if it is not a simple "fast-forward"
+        command = ['fetch', '-t', self.repourl, '+%s' % self.branch]
         self.sendStatus({"header": "fetching branch %s from %s\n"
                                         % (self.branch, self.repourl)})
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didFetch)
-        return d
+        return self._dovccmd(command, self._didFetch)
+
+    def _didClean(self, dummy):
+        # After a clean, try to use the given revision if we have one.
+        if self.revision:
+            # We know what revision we want.  See if we have it.
+            d = self._dovccmd(['reset', '--hard', self.revision],
+                              self._initSubmodules)
+            # If we are unable to reset to the specified version, we
+            # must do a fetch first and retry.
+            d.addErrback(self._doFetch)
+            return d
+        else:
+            # No known revision, go grab the latest.
+            return self._doFetch(None)
 
     def _didInit(self, res):
         return self.doVCUpdate()
 
     def doVCFull(self):
-        os.mkdir(self._fullSrcdir())
-        c = ShellCommand(self.builder, ['git', 'init'], self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didInit)
-        return d
+        os.makedirs(self._fullSrcdir())
+        return self._dovccmd(['init'], self._didInit)
 
     def parseGotRevision(self):
-        command = ['git', 'rev-parse', 'HEAD']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, keepStdout=True, usePTY=False)
-        d = c.start()
+        command = ['rev-parse', 'HEAD']
         def _parse(res):
-            hash = c.stdout.strip()
+            hash = self.command.stdout.strip()
             if len(hash) != 40:
                 return None
             return hash
-        d.addCallback(_parse)
-        return d
+        return self._dovccmd(command, _parse, keepStdout=True)
 
 registerSlaveCommand("git", Git, command_version)
 
@@ -2141,18 +2400,15 @@ class Arch(SourceBase):
                                             self.buildconfig)
 
     def sourcedirIsUpdateable(self):
-        if self.revision:
-            # Arch cannot roll a directory backwards, so if they ask for a
-            # specific revision, clobber the directory. Technically this
-            # could be limited to the cases where the requested revision is
-            # later than our current one, but it's too hard to extract the
-            # current revision from the tree.
-            return False
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
-        return os.path.isdir(os.path.join(self.builder.basedir,
-                                          self.srcdir, "{arch}"))
+        # Arch cannot roll a directory backwards, so if they ask for a
+        # specific revision, clobber the directory. Technically this
+        # could be limited to the cases where the requested revision is
+        # later than our current one, but it's too hard to extract the
+        # current revision from the tree.
+        return (not self.revision and
+                not self.sourcedirIsPatched() and
+                os.path.isdir(os.path.join(self.builder.basedir,
+                                           self.srcdir, "{arch}")))
 
     def doVCUpdate(self):
         # update: possible for mode in ('copy', 'update')
@@ -2161,7 +2417,8 @@ class Arch(SourceBase):
         if self.revision:
             command.append(self.revision)
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2173,8 +2430,8 @@ class Arch(SourceBase):
 
         command = [self.vcexe, 'register-archive', '--force', self.url]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, keepStdout=True,
-                         timeout=self.timeout, usePTY=False)
+                         sendRC=False, keepStdout=True, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2207,7 +2464,8 @@ class Arch(SourceBase):
                    '--no-pristine',
                    ver, self.srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2219,7 +2477,8 @@ class Arch(SourceBase):
         d = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'build-config', self.buildconfig]
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2279,7 +2538,8 @@ class Bazaar(Arch):
         command = [self.vcexe, 'get', '--no-pristine',
                    ver, self.srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2327,14 +2587,11 @@ class Bzr(SourceBase):
         self.forceSharedRepo = args.get('forceSharedRepo')
 
     def sourcedirIsUpdateable(self):
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
-        if self.revision:
-            # checking out a specific revision requires a full 'bzr checkout'
-            return False
-        return os.path.isdir(os.path.join(self.builder.basedir,
-                                          self.srcdir, ".bzr"))
+        # checking out a specific revision requires a full 'bzr checkout'
+        return (not self.revision and
+                not self.sourcedirIsPatched() and
+                os.path.isdir(os.path.join(self.builder.basedir,
+                                           self.srcdir, ".bzr")))
 
     def start(self):
         def cont(res):
@@ -2354,7 +2611,8 @@ class Bzr(SourceBase):
         srcdir = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'update']
         c = ShellCommand(self.builder, command, srcdir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2382,7 +2640,8 @@ class Bzr(SourceBase):
         command.append(self.srcdir)
 
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         return d
@@ -2397,13 +2656,15 @@ class Bzr(SourceBase):
         command.append(self.repourl)
         command.append(tmpdir)
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         def _export(res):
             command = [self.vcexe, 'export', srcdir]
             c = ShellCommand(self.builder, command, tmpdir,
-                             sendRC=False, timeout=self.timeout, usePTY=False)
+                             sendRC=False, timeout=self.timeout,
+                             maxTime=self.maxTime, usePTY=False)
             self.command = c
             return c.start()
         d.addCallback(_export)
@@ -2469,7 +2730,8 @@ class Mercurial(SourceBase):
     """Mercurial specific VC operation. In addition to the arguments
     handled by SourceBase, this command reads the following keys:
 
-    ['repourl'] (required): the Cogito repository string
+    ['repourl'] (required): the Mercurial repository string
+    ['clobberOnBranchChange']: Document me. See ticket #462.
     """
 
     header = "mercurial operation"
@@ -2478,8 +2740,9 @@ class Mercurial(SourceBase):
         SourceBase.setup(self, args)
         self.vcexe = getCommand("hg")
         self.repourl = args['repourl']
-        self.clobberOnBranchChange = args['clobberOnBranchChange']
+        self.clobberOnBranchChange = args.get('clobberOnBranchChange', True)
         self.sourcedata = "%s\n" % self.repourl
+        self.branchType = args.get('branchType', 'dirname')
         self.stdout = ""
         self.stderr = ""
 
@@ -2492,7 +2755,7 @@ class Mercurial(SourceBase):
         command = [self.vcexe, 'pull', '--verbose', self.repourl]
         c = ShellCommand(self.builder, command, d,
                          sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._handleEmptyUpdate)
@@ -2511,9 +2774,17 @@ class Mercurial(SourceBase):
 
     def doVCFull(self):
         d = os.path.join(self.builder.basedir, self.srcdir)
-        command = [self.vcexe, 'clone', '--verbose', '--noupdate', self.repourl, d]
+        command = [self.vcexe, 'clone', '--verbose', '--noupdate']
+
+        # if got revision, clobbering and in dirname, only clone to specific revision
+        # (otherwise, do full clone to re-use .hg dir for subsequent builds)
+        if self.args.get('revision') and self.mode == 'clobber' and self.branchType == 'dirname':
+            command.extend(['--rev', self.args.get('revision')])
+        command.extend([self.repourl, d])
+
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         cmd1 = c.start()
         cmd1.addCallback(self._update)
@@ -2585,8 +2856,7 @@ class Mercurial(SourceBase):
                 msg = "Fresh hg repo, don't worry about in-repo branch name"
                 log.msg(msg)
 
-            elif os.path.exists(os.path.join(self.builder.basedir,
-                                             self.srcdir, ".buildbot-patched")):
+            elif self.sourcedirIsPatched():
                 self.clobber = self._purge
 
             elif self.update_branch != current_branch:
@@ -2638,6 +2908,9 @@ class Mercurial(SourceBase):
                 else:
                     repourl = self.repourl
 
+                oldurl = remove_userpassword(oldurl)
+                repourl = remove_userpassword(repourl)
+
                 if oldurl != repourl:
                     self.clobber = self._clobber
                     msg = "RepoURL changed from '%s' in wc to '%s' in update. Clobbering" % (oldurl, repourl)
@@ -2678,7 +2951,7 @@ class Mercurial(SourceBase):
             updatecmd.extend(['--rev', self.args.get('branch',  'default')])
         self.command = ShellCommand(self.builder, updatecmd,
             self.builder.basedir, sendRC=False,
-            timeout=self.timeout, usePTY=False)
+            timeout=self.timeout, maxTime=self.maxTime, usePTY=False)
         return self.command.start()
 
     def parseGotRevision(self):
@@ -2726,11 +2999,13 @@ class P4Base(SourceBase):
             command.extend(['-P', self.p4passwd])
         if self.p4client:
             command.extend(['-c', self.p4client])
-        command.extend(['changes', '-m', '1', '#have'])
+        # add '-s submitted' for bug #626
+        command.extend(['changes', '-s', 'submitted', '-m', '1', '#have'])
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=self.env, timeout=self.timeout,
-                         sendStdout=True, sendStderr=False, sendRC=False,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, sendStdout=True,
+                         sendStderr=False, sendRC=False, keepStdout=True,
+                         usePTY=False)
         self.command = c
         d = c.start()
 
@@ -2785,14 +3060,12 @@ class P4(P4Base):
 
 
     def sourcedirIsUpdateable(self):
-        if os.path.exists(os.path.join(self.builder.basedir,
-                                       self.srcdir, ".buildbot-patched")):
-            return False
         # We assume our client spec is still around.
         # We just say we aren't updateable if the dir doesn't exist so we
         # don't get ENOENT checking the sourcedata.
-        return os.path.isdir(os.path.join(self.builder.basedir,
-                                          self.srcdir))
+        return (not self.sourcedirIsPatched() and
+                os.path.isdir(os.path.join(self.builder.basedir,
+                                           self.srcdir)))
 
     def doVCUpdate(self):
         return self._doP4Sync(force=False)
@@ -2816,7 +3089,7 @@ class P4(P4Base):
         env = {}
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=env, sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2853,12 +3126,19 @@ class P4(P4Base):
         log.msg(client_spec)
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=env, sendRC=False, timeout=self.timeout,
-                         initialStdin=client_spec, usePTY=False)
+                         maxTime=self.maxTime, initialStdin=client_spec,
+                         usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
         d.addCallback(lambda _: self._doP4Sync(force=True))
         return d
+
+    def parseGotRevision(self):
+        rv = None
+        if self.revision:
+            rv = str(self.revision)
+        return rv
 
 registerSlaveCommand("p4", P4, command_version)
 
@@ -2901,7 +3181,8 @@ class P4Sync(P4Base):
             command.extend(['@' + self.revision])
         env = {}
         c = ShellCommand(self.builder, command, d, environ=env,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2910,5 +3191,11 @@ class P4Sync(P4Base):
 
     def doVCFull(self):
         return self._doVC(force=True)
+
+    def parseGotRevision(self):
+        rv = None
+        if self.revision:
+            rv = str(self.revision)
+        return rv
 
 registerSlaveCommand("p4sync", P4Sync, command_version)

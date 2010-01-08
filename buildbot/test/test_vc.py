@@ -1,4 +1,5 @@
 # -*- test-case-name: buildbot.test.test_vc -*-
+# -*- coding: utf-8 -*-
 
 import sys, os, time, re
 from email.Utils import mktime_tz, parsedate_tz
@@ -56,6 +57,7 @@ config_vc = """
 from buildbot.process import factory
 from buildbot.steps import source
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
 s = factory.s
 
 f1 = factory.BuildFactory([
@@ -64,8 +66,9 @@ f1 = factory.BuildFactory([
 c = {}
 c['slaves'] = [BuildSlave('bot1', 'sekrit')]
 c['schedulers'] = []
-c['builders'] = [{'name': 'vc', 'slavename': 'bot1',
-                  'builddir': 'vc-dir', 'factory': f1}]
+c['builders'] = [
+    BuilderConfig(name='vç', slavename='bot1', factory=f1, builddir='vc-dir'),
+]
 c['slavePortnum'] = 0
 # do not compress logs in tests
 c['logCompressionLimit'] = False
@@ -85,10 +88,19 @@ diff -u -r1.1.1.1 subdir.c
  main(int argc, const char *argv[])
  {
 -    printf("Hello subdir.\n");
-+    printf("Hello patched subdir.\n");
++    printf("HellÒ patched subdir.\n");
      return 0;
  }
 """
+
+# Test buildbot try --root support.
+subdir_diff = p0_diff.replace('subdir/subdir.c', 'subdir.c')
+
+# Test --patchlevel support.
+p2_diff = p0_diff.replace('subdir/subdir.c', 'foo/bar/subdir/subdir.c')
+
+# Used in do_patch() test.
+PATCHLEVEL0, SUBDIR_ROOT, PATCHLEVEL2 = range(3)
 
 # this patch does not include the filename headers, so it is
 # patchlevel-neutral
@@ -98,7 +110,7 @@ TRY_PATCH = '''
  main(int argc, const char *argv[])
  {
 -    printf("Hello subdir.\\n");
-+    printf("Hello try.\\n");
++    printf("HÉllo try.\\n");
      return 0;
  }
 '''
@@ -286,7 +298,8 @@ class BaseHelper:
         # you must call this from createRepository
         self.repbase = os.path.abspath(os.path.join("test_vc",
                                                     "repositories"))
-        _makedirsif(self.repbase)
+        rmdirRecursive(self.repbase)
+        os.makedirs(self.repbase)
             
     def createRepository(self):
         # this will only be called once per process
@@ -419,7 +432,7 @@ class VCBase(SignalMixin):
                                self.slavebase, keepalive=0, usePTY=False)
         self.slave = slave
         slave.startService()
-        d = self.master.botmaster.waitUntilBuilderAttached("vc")
+        d = self.master.botmaster.waitUntilBuilderAttached("vç")
         return d
 
     def loadConfig(self, config):
@@ -428,7 +441,7 @@ class VCBase(SignalMixin):
         # to stop and restart the slave.
         d = defer.succeed(None)
         if self.slave:
-            d = self.master.botmaster.waitUntilBuilderDetached("vc")
+            d = self.master.botmaster.waitUntilBuilderDetached("vç")
             self.slave.stopService()
         d.addCallback(lambda res: self.master.loadConfig(config))
         d.addCallback(lambda res: self.connectSlave())
@@ -449,7 +462,7 @@ class VCBase(SignalMixin):
         #print "doBuild(ss: b=%s rev=%s)" % (ss.branch, ss.revision)
         req = base.BuildRequest("test_vc forced build", ss, 'test_builder')
         d = req.waitUntilFinished()
-        c.getBuilder("vc").requestBuild(req)
+        c.getBuilder("vç").requestBuild(req)
         d.addCallback(self._doBuild_1, shouldSucceed)
         return d
     def _doBuild_1(self, bs, shouldSucceed):
@@ -515,7 +528,7 @@ class VCBase(SignalMixin):
             s += ", %s=%s" % (k, repr(v))
         s += ")"
         config = config_vc % s
-
+        
         m.loadConfig(config % 'clobber')
         m.readConfig = True
         m.startService()
@@ -557,6 +570,9 @@ class VCBase(SignalMixin):
         self.failUnlessEqual(bs.getProperty("branch"), None)
         self.checkGotRevisionIsLatest(bs)
 
+        # Check that we can handle unfriendly permissions.
+        os.chmod(os.path.join(self.workdir, "subdir"), 0)
+        # Check that clobber really clobbers any old stuff.
         self.touch(self.workdir, "newfile")
         self.shouldExist(self.workdir, "newfile")
         d = self.doBuild() # rebuild clobbers workdir
@@ -725,7 +741,7 @@ class VCBase(SignalMixin):
         #self.checkGotRevisionIsLatest(bs)
         # VC 'export' is not required to have a got_revision
 
-    def do_patch(self):
+    def do_patch(self, type):
         vctype = self.vctype
         args = self.helper.vcargs
         m = self.master
@@ -736,12 +752,19 @@ class VCBase(SignalMixin):
             s += ", %s=%s" % (k, repr(v))
         s += ")"
         self.config = config_vc % s
-
+        if type == PATCHLEVEL0:
+            self.patch = (0, p0_diff)
+        elif type == SUBDIR_ROOT:
+            self.patch = (0, subdir_diff, 'subdir')
+        elif type == PATCHLEVEL2:
+            self.patch = (2, p2_diff)
+        else:
+            raise NotImplementedError
         m.loadConfig(self.config % "clobber")
         m.readConfig = True
         m.startService()
 
-        ss = SourceStamp(revision=self.helper.trunk[-1], patch=(0, p0_diff))
+        ss = SourceStamp(revision=self.helper.trunk[-1], patch=self.patch)
 
         d = self.connectSlave()
         d.addCallback(lambda res: self.doBuild(ss=ss))
@@ -754,7 +777,7 @@ class VCBase(SignalMixin):
         subdir_c = os.path.join(self.slavebase, "vc-dir", "build",
                                 "subdir", "subdir.c")
         data = open(subdir_c, "r").read()
-        self.failUnlessIn("Hello patched subdir.\\n", data)
+        self.failUnlessIn("HellÒ patched subdir.\\n", data)
         self.failUnlessEqual(bs.getProperty("revision"),
                              self.helper.trunk[-1] or None)
         self.checkGotRevision(bs, self.helper.trunk[-1])
@@ -782,7 +805,7 @@ class VCBase(SignalMixin):
         return self._doPatch_3()
 
     def _doPatch_3(self, res=None):
-        ss = SourceStamp(revision=self.helper.trunk[-2], patch=(0, p0_diff))
+        ss = SourceStamp(revision=self.helper.trunk[-2], patch=self.patch)
         d = self.doBuild(ss=ss)
         d.addCallback(self._doPatch_4)
         return d
@@ -793,7 +816,7 @@ class VCBase(SignalMixin):
         subdir_c = os.path.join(self.slavebase, "vc-dir", "build",
                                 "subdir", "subdir.c")
         data = open(subdir_c, "r").read()
-        self.failUnlessIn("Hello patched subdir.\\n", data)
+        self.failUnlessIn("HellÒ patched subdir.\\n", data)
         self.failUnlessEqual(bs.getProperty("revision"),
                              self.helper.trunk[-2] or None)
         self.checkGotRevision(bs, self.helper.trunk[-2])
@@ -801,7 +824,7 @@ class VCBase(SignalMixin):
         # now check that we can patch a branch
         ss = SourceStamp(branch=self.helper.branchname,
                          revision=self.helper.branch[-1],
-                         patch=(0, p0_diff))
+                         patch=self.patch)
         d = self.doBuild(ss=ss)
         d.addCallback(self._doPatch_5)
         return d
@@ -812,7 +835,7 @@ class VCBase(SignalMixin):
         subdir_c = os.path.join(self.slavebase, "vc-dir", "build",
                                 "subdir", "subdir.c")
         data = open(subdir_c, "r").read()
-        self.failUnlessIn("Hello patched subdir.\\n", data)
+        self.failUnlessIn("HellÒ patched subdir.\\n", data)
         self.failUnlessEqual(bs.getProperty("revision"),
                              self.helper.branch[-1] or None)
         self.failUnlessEqual(bs.getProperty("branch"), self.helper.branchname or None)
@@ -1040,6 +1063,8 @@ class VCBase(SignalMixin):
 
 
     def dumpPatch(self, patch):
+        # FIXME: This function is never called.
+        raise NotImplementedError
         # this exists to help me figure out the right 'patchlevel' value
         # should be returned by tryclient.getSourceStamp
         n = self.mktemp()
@@ -1054,7 +1079,7 @@ class VCBase(SignalMixin):
         self.tearDownSignalHandler()
         d = defer.succeed(None)
         if self.slave:
-            d2 = self.master.botmaster.waitUntilBuilderDetached("vc")
+            d2 = self.master.botmaster.waitUntilBuilderDetached("vç")
             d.addCallback(lambda res: self.slave.stopService())
             d.addCallback(lambda res: d2)
         if self.master:
@@ -1211,7 +1236,15 @@ class CVS(VCBase, unittest.TestCase):
         return d
 
     def testPatch(self):
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -1223,6 +1256,68 @@ class CVS(VCBase, unittest.TestCase):
         return d
 
 VCS.registerVC(CVS.vc_name, CVSHelper())
+
+class CVSHelper_checkout_options(CVSHelper):
+    """
+    Specialized CVSHelper to set checkout_options to verify that it works
+    """
+    def createRepository(self):
+        self.createBasedir()
+        self.cvsrep = cvsrep = os.path.join(self.repbase, "CVS-Repository")
+        tmp = os.path.join(self.repbase, "cvstmp")
+
+        w = self.dovc(self.repbase, ['-d',  cvsrep,  'init'])
+        yield w; w.getResult() # we must getResult() to raise any exceptions
+
+        self.populate(tmp)
+        cmd = ['-d',  self.cvsrep,  'import',
+                '-m', 'sample_project_files', 'sample',  'vendortag',  'start']
+        w = self.dovc(tmp, cmd)
+        yield w; w.getResult()
+        rmdirRecursive(tmp)
+        # take a timestamp as the first revision number
+        time.sleep(2)
+        self.addTrunkRev(self.getdate())
+        time.sleep(2)
+
+        w = self.dovc(self.repbase,
+                      ['-d',  self.cvsrep, 'checkout', '-d',  'cvstmp',  'sample'])
+        yield w; w.getResult()
+
+        w = self.dovc(tmp, ['tag',  '-b', self.branchname])
+        yield w; w.getResult()
+        self.populate_branch(tmp)
+        w = self.dovc(tmp,
+                      ['commit',  '-m',  'commit_on_branch',  '-r', self.branchname])
+        yield w; w.getResult()
+        rmdirRecursive(tmp)
+        time.sleep(2)
+        self.addBranchRev(self.getdate())
+        time.sleep(2)
+        self.vcargs = { 'cvsroot': self.cvsrep, 
+                        'cvsmodule': "sample",
+                        'checkout_options':["-P"] }
+    createRepository = deferredGenerator(createRepository)
+
+
+class CVS_checkout_options(CVS):
+    """
+    Specialized CVS_checkout_options class to use with 
+    CVSHelper_checkout_options
+    set checkout_options to verify that it works
+    """
+    vc_name = "cvs"
+
+    metadir = "CVS"
+    vctype = "source.CVS"
+    vctype_try = "cvs"
+    # CVS gives us got_revision, but it is based entirely upon the local
+    # clock, which means it is unlikely to match the timestamp taken earlier.
+    # This might be enough for common use, but won't be good enough for our
+    # tests to accept, so pretend it doesn't have got_revision at all.
+    has_got_revision = False
+
+VCS.registerVC(CVS_checkout_options.vc_name, CVSHelper_checkout_options())
 
 
 class SVNHelper(BaseHelper):
@@ -1356,7 +1451,21 @@ class SVN(VCBase, unittest.TestCase):
         self.helper.vcargs = { 'baseURL': self.helper.svnurl + "/",
                                'defaultBranch': "sample/trunk",
                                }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'baseURL': self.helper.svnurl + "/",
+                               'defaultBranch': "sample/trunk",
+                               }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'baseURL': self.helper.svnurl + "/",
+                               'defaultBranch': "sample/trunk",
+                               }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -1545,7 +1654,21 @@ class P4(VCBase, unittest.TestCase):
         self.helper.vcargs = { 'p4port': self.helper.p4port,
                                'p4base': '//depot/',
                                'defaultBranch': 'trunk' }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'p4port': self.helper.p4port,
+                               'p4base': '//depot/',
+                               'defaultBranch': 'trunk' }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'p4port': self.helper.p4port,
+                               'p4base': '//depot/',
+                               'defaultBranch': 'trunk' }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
 VCS.registerVC(P4.vc_name, P4Helper())
@@ -1662,7 +1785,19 @@ class Darcs(VCBase, unittest.TestCase):
     def testPatch(self):
         self.helper.vcargs = { 'baseURL': self.helper.darcs_base + "/",
                                'defaultBranch': "trunk" }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'baseURL': self.helper.darcs_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'baseURL': self.helper.darcs_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -1964,7 +2099,19 @@ class Arch(VCBase, unittest.TestCase):
     def testPatch(self):
         self.helper.vcargs = {'url': self.helper.archrep,
                               'version': self.helper.defaultbranch }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = {'url': self.helper.archrep,
+                              'version': self.helper.defaultbranch }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = {'url': self.helper.archrep,
+                              'version': self.helper.defaultbranch }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2042,7 +2189,25 @@ class Bazaar(Arch):
                               'archive': self.helper.archname,
                               'version': self.helper.defaultbranch,
                               }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = {'url': self.helper.archrep,
+                              # Baz adds the required 'archive' argument
+                              'archive': self.helper.archname,
+                              'version': self.helper.defaultbranch,
+                              }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = {'url': self.helper.archrep,
+                              # Baz adds the required 'archive' argument
+                              'archive': self.helper.archname,
+                              'version': self.helper.defaultbranch,
+                              }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2080,7 +2245,6 @@ class Bazaar(Arch):
         self.serveHTTP()
 
         # break the repository server
-        from twisted.web import static
         self.site.resource = static.Data("Sorry, repository is offline",
                                          "text/plain")
         # and arrange to fix it again in 5 seconds, while the test is
@@ -2112,7 +2276,6 @@ class Bazaar(Arch):
         self.serveHTTP()
 
         # break the repository server, and leave it broken
-        from twisted.web import static
         self.site.resource = static.Data("Sorry, repository is offline",
                                          "text/plain")
 
@@ -2230,7 +2393,7 @@ class BzrHelper(BaseHelper):
             rep = self.rep_trunk
         else:
             rep = os.path.join(self.bzr_base, branch)
-        w = self.dovc(self.bzr_base, ["checkout", rep, workdir])
+        w = self.dovc(self.bzr_base, ["clone", rep, workdir])
         yield w; w.getResult()
         open(os.path.join(workdir, "subdir", "subdir.c"), "w").write(TRY_C)
     vc_try_checkout = deferredGenerator(vc_try_checkout)
@@ -2259,11 +2422,25 @@ class Bzr(VCBase, unittest.TestCase):
         # TODO: testRetry has the same problem with Bzr as it does for
         # Arch
         return d
+    # Bzr is *slow*, and the testCheckout step takes a *very* long time
+    testCheckout.timeout = 480
 
     def testPatch(self):
         self.helper.vcargs = { 'baseURL': self.helper.bzr_base + "/",
                                'defaultBranch': "trunk" }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'baseURL': self.helper.bzr_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'baseURL': self.helper.bzr_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2289,7 +2466,6 @@ class Bzr(VCBase, unittest.TestCase):
         self.serveHTTP()
 
         # break the repository server
-        from twisted.web import static
         self.site.resource = static.Data("Sorry, repository is offline",
                                          "text/plain")
         # and arrange to fix it again in 5 seconds, while the test is
@@ -2319,7 +2495,6 @@ class Bzr(VCBase, unittest.TestCase):
         self.serveHTTP()
 
         # break the repository server, and leave it broken
-        from twisted.web import static
         self.site.resource = static.Data("Sorry, repository is offline",
                                          "text/plain")
 
@@ -2377,7 +2552,7 @@ class MercurialHelper(BaseHelper):
         yield w; w.getResult()
         w = self.dovc(tmp, "add")
         yield w; w.getResult()
-        w = self.dovc(tmp, ['commit', '-m', 'initial_import'])
+        w = self.dovc(tmp, ['commit', '-m', 'initial_import', '--user' ,'bbtests@localhost' ])
         yield w; w.getResult()
         w = self.dovc(tmp, ['push', self.rep_trunk])
         # note that hg-push does not actually update the working directory
@@ -2387,7 +2562,7 @@ class MercurialHelper(BaseHelper):
         self.addTrunkRev(self.extract_id(out))
 
         self.populate_branch(tmp)
-        w = self.dovc(tmp, ['commit', '-m', 'commit_on_branch'])
+        w = self.dovc(tmp, ['commit', '-m', 'commit_on_branch', '--user' ,'bbtests@localhost' ])
         yield w; w.getResult()
         w = self.dovc(tmp, ['push', self.rep_branch])
         yield w; w.getResult()
@@ -2410,7 +2585,7 @@ class MercurialHelper(BaseHelper):
         # force the mtime forward a little bit
         future = time.time() + 2*self.version
         os.utime(version_c_filename, (future, future))
-        w = self.dovc(tmp, ['commit', '-m', 'revised_to_%d' % self.version])
+        w = self.dovc(tmp, ['commit', '-m', 'revised_to_%d' % self.version, '--user' ,'bbtests@localhost' ])
         yield w; w.getResult()
         w = self.dovc(tmp, ['push', self.rep_trunk])
         yield w; w.getResult()
@@ -2483,7 +2658,19 @@ class Mercurial(VCBase, unittest.TestCase):
     def testPatch(self):
         self.helper.vcargs = { 'baseURL': self.helper.hg_base + "/",
                                'defaultBranch': "trunk" }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'baseURL': self.helper.hg_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'baseURL': self.helper.hg_base + "/",
+                               'defaultBranch': "trunk" }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2679,7 +2866,17 @@ class MercurialInRepo(Mercurial):
 
     def testPatch(self):
         self.helper.vcargs = self.default_args()
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = self.default_args()
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = self.default_args()
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2818,6 +3015,12 @@ class GitHelper(BaseHelper):
         w = self.dovc(self.repbase, "init", env=env)
         yield w; w.getResult()
 
+        # NetBSD pkgsrc uses templates that stupidly enable the update hook, requiring
+        # a non-default description.  This is broken, but easily worked around.
+        # http://www.netbsd.org/cgi-bin/query-pr-single.pl?number=41683
+        descrfile = os.path.join(self.gitrepo, "description")
+        open(descrfile, "w").write("NetBSD workaround")
+
         self.populate(tmp)
         w = self.dovc(tmp, "init")
         yield w; w.getResult()
@@ -2921,7 +3124,19 @@ class Git(VCBase, unittest.TestCase):
     def testPatch(self):
         self.helper.vcargs = { 'repourl': self.helper.gitrepo,
                                'branch': "master" }
-        d = self.do_patch()
+        d = self.do_patch(PATCHLEVEL0)
+        return d
+
+    def testPatchSubDir(self):
+        self.helper.vcargs = { 'repourl': self.helper.gitrepo,
+                               'branch': "master" }
+        d = self.do_patch(SUBDIR_ROOT)
+        return d
+
+    def testPatchP2(self):
+        self.helper.vcargs = { 'repourl': self.helper.gitrepo,
+                               'branch': "master" }
+        d = self.do_patch(PATCHLEVEL2)
         return d
 
     def testCheckoutBranch(self):
@@ -2934,45 +3149,6 @@ class Git(VCBase, unittest.TestCase):
         self.helper.vcargs = { 'repourl': self.helper.gitrepo,
                                'branch': "master" }
         d = self.do_getpatch()
-        return d
-
-    # The git tests override parts of the test sequence to demonstrate
-    # different update behavior.  In the git cases, we always
-    # effectively have a clobbered tree.
-
-    def _do_vctest_update_3(self, bs):
-        log.msg("_do_vctest_update_3")
-        self.shouldExist(self.workdir, "main.c")
-        self.shouldExist(self.workdir, "version.c")
-        self.shouldContain(self.workdir, "version.c",
-                           "version=%d" % self.helper.version)
-        self.failUnlessEqual(bs.getProperty("revision"), None)
-        self.checkGotRevisionIsLatest(bs)
-
-        # now "update" to an older revision
-        d = self.doBuild(ss=SourceStamp(revision=self.helper.trunk[-2]))
-        d.addCallback(self._do_vctest_update_4)
-        return d
-
-    def _do_vctest_copy_2(self, bs):
-        log.msg("_do_vctest_copy 3")
-        if self.metadir:
-            self.shouldExist(self.workdir, self.metadir)
-        self.shouldNotExist(self.workdir, "newfile")
-        self.failUnlessEqual(bs.getProperty("revision"), None)
-        self.checkGotRevisionIsLatest(bs)
-        self.touch(self.workdir, "newfile")
-
-    def _doBranch_3(self, bs):
-        log.msg("_doBranch_3")
-        # make sure it is still on the branch
-        main_c = os.path.join(self.slavebase, "vc-dir", "build", "main.c")
-        data = open(main_c, "r").read()
-        self.failUnlessIn("Hello branch.", data)
-
-        # now make sure that a non-branch checkout clobbers the tree
-        d = self.doBuild(ss=SourceStamp())
-        d.addCallback(self._doBranch_4)
         return d
 
 VCS.registerVC(Git.vc_name, GitHelper())
@@ -3090,4 +3266,4 @@ class Patch(VCBase, unittest.TestCase):
         # make sure the file actually got patched
         subdir_c = os.path.join(self.workdir, "subdir", "subdir.c")
         data = open(subdir_c, "r").read()
-        self.failUnlessIn("Hello patched subdir.\\n", data)
+        self.failUnlessIn("HellÒ patched subdir.\\n", data)

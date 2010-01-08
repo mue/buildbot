@@ -1,4 +1,3 @@
-
 from twisted.python import log
 from twisted.web import xmlrpc
 from buildbot.status.builder import Results
@@ -28,6 +27,18 @@ class XMLRPCServer(xmlrpc.XMLRPC):
         builder = self.status.getBuilder(builder_name)
         lastbuild = builder.getBuild(-1)
         return Results[lastbuild.getResults()]
+    
+    def xmlrpc_getLastBuildsAllBuilders(self, num_builds):
+        """Return the last N completed builds for all builders.
+        
+        'num_builds' is the number of builds for each builder to
+            return
+
+        """
+        all_builds = []
+        for name in self.status.getBuilderNames():
+            all_builds.extend(self.xmlrpc_getLastBuilds(name, num_builds))
+        return all_builds
 
     def xmlrpc_getLastBuilds(self, builder_name, num_builds):
         """Return the last N completed builds for the given builder.
@@ -56,14 +67,26 @@ class XMLRPCServer(xmlrpc.XMLRPC):
             except KeyError:
                 revision = ""
             revision = str(revision)
-
+            
+            result = Results[build.getResults()]
+            if result == 'failure':
+                fail_names = result = build.getText()[1:]
+                reasons = []
+                for s in build.getSteps():
+                    if s.getName() in fail_names:
+                        reasons.append(s.getText())
+            else:
+                result = build.getText()
+                reasons = []
             answer = (builder_name,
                       build.getNumber(),
+                      build_start,
                       build_end,
                       branch,
                       revision,
                       Results[build.getResults()],
-                      build.getText(),
+                      result,
+                      reasons,
                       )
             all_builds.append((build_end, answer))
 
@@ -168,6 +191,7 @@ class XMLRPCServer(xmlrpc.XMLRPC):
         info['slavename'] = build.getSlavename()
         info['results'] = build.getResults()
         info['text'] = build.getText()
+        info['reasons'] = []
         # Added to help out requests for build -N
         info['number'] = build.number
         ss = build.getSourceStamp()
@@ -181,23 +205,33 @@ class XMLRPCServer(xmlrpc.XMLRPC):
             revision = ""
         info['revision'] = str(revision)
         info['start'], info['end'] = build.getTimes()
-
+        
+        step_names = {}
+        
         info_steps = []
         for s in build.getSteps():
             stepinfo = {}
             stepinfo['name'] = s.getName()
             stepinfo['start'], stepinfo['end'] = s.getTimes()
             stepinfo['results'] = s.getResults()
+            stepinfo['text'] = s.getText()
             info_steps.append(stepinfo)
+            if info['text'][0] == 'failed' and stepinfo['name'] in info['text']:
+                info['reasons'].append(stepinfo['text'])
+            step_names[stepinfo['name']] = stepinfo
         info['steps'] = info_steps
 
         info_logs = []
+        info['full_error'] = {}
         for l in build.getLogs():
             loginfo = {}
-            loginfo['name'] = l.getStep().getName() + "/" + l.getName()
+            name = l.getStep().getName()
+            loginfo['name'] = name + "/" + l.getName()
             #loginfo['text'] = l.getText()
             loginfo['text'] = "HUGE"
+            if step_names.get(name):
+                if step_names[name]['text'][-1] == 'failed':
+                    info['full_error'][name] = l.getText()
             info_logs.append(loginfo)
         info['logs'] = info_logs
         return info
-

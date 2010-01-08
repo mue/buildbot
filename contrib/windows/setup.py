@@ -8,9 +8,8 @@ import sys
 import os
 import tempfile
 import shutil
-import py2exe
 
-from os.path import dirname, join, abspath, exists, splitext
+from os.path import dirname, join, abspath, splitext
 
 this_dir = abspath(dirname(__file__))
 bb_root_dir = abspath(join(this_dir, "..", ".."))
@@ -66,7 +65,7 @@ shutil.copy(servicemanager.__file__, msg_file)
 
 data_files = [
     ["", [msg_file]],
-    ["", [join(bb_root_dir, "buildbot", "status", "web", "classic.css")]],
+    ["", [join(bb_root_dir, "buildbot", "status", "web", "default.css")]],
     ["", [join(bb_root_dir, "buildbot", "buildbot.png")]],
 ]
 

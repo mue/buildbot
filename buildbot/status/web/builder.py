@@ -6,15 +6,17 @@ from twisted.web.util import Redirect
 import re, urllib, time
 from twisted.python import log
 from buildbot import interfaces
-from buildbot.status.web.base import HtmlResource, make_row, \
-     make_force_build_form, OneLineMixin, path_to_build, path_to_slave, path_to_builder
+from buildbot.status.web.base import HtmlResource, BuildLineMixin, \
+    path_to_build, path_to_slave, path_to_builder, path_to_change, \
+    getAndCheckProperties
 from buildbot.process.base import BuildRequest
 from buildbot.sourcestamp import SourceStamp
 
 from buildbot.status.web.build import BuildsResource, StatusResourceBuild
+from buildbot import util
 
 # /builders/$builder
-class StatusResourceBuilder(HtmlResource, OneLineMixin):
+class StatusResourceBuilder(HtmlResource, BuildLineMixin):
     addSlash = True
 
     def __init__(self, builder_status, builder_control):
@@ -23,112 +25,94 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         self.builder_control = builder_control
 
     def getTitle(self, request):
-        return "Buildbot: %s" % html.escape(self.builder_status.getName())
+        return "Buildbot: %s" % self.builder_status.getName()
 
-    def build_line(self, build, req):
-        buildnum = build.getNumber()
-        buildurl = path_to_build(req, build)
-        data = '<a href="%s">#%d</a> ' % (buildurl, buildnum)
+    def builder(self, build, req):
+        b = {}
 
-        when = build.getETA()
+        b['num'] = build.getNumber()
+        b['link'] = path_to_build(req, build)
+
+        when = b['when'] = build.getETA()
         if when is not None:
-            when_time = time.strftime("%H:%M:%S",
+            b['when_time'] = time.strftime("%H:%M:%S",
                                       time.localtime(time.time() + when))
-            data += "ETA %ds (%s) " % (when, when_time)
+                    
         step = build.getCurrentStep()
         if step:
-            data += "[%s]" % step.getName()
+            b['current_step'] = step.getName()
         else:
-            data += "[waiting for Lock]"
+            b['current_step'] = "[waiting for Lock]"
             # TODO: is this necessarily the case?
 
-        if self.builder_control is not None:
-            stopURL = path_to_build(req, build) + '/stop'
-            data += '''
-<form action="%s" class="command stopbuild" style="display:inline">
-  <input type="submit" value="Stop Build" />
-</form>''' % stopURL
-        return data
+        builder_control = self.getControl(req)
+        if builder_control is not None:
+            b['stop_url'] = path_to_build(req, build) + '/stop'
 
-    def body(self, req):
+        return b
+          
+    def content(self, req, cxt):
         b = self.builder_status
         control = self.builder_control
         status = self.getStatus(req)
 
+        cxt['name'] = b.getName()
+        
         slaves = b.getSlaves()
         connected_slaves = [s for s in slaves if s.isConnected()]
 
-        projectName = status.getProjectName()
+        cxt['current'] = [self.builder(x, req) for x in b.getCurrentBuilds()]        
+            
+        cxt['pending'] = []        
+        for pb in b.getPendingBuilds():
+            changes = []
 
-        data = '<a href="%s">%s</a>\n' % (self.path_to_root(req), projectName)
-
-        data += "<h1>Builder: %s</h1>\n" % html.escape(b.getName())
-
-        # the first section shows builds which are currently running, if any.
-
-        current = b.getCurrentBuilds()
-        if current:
-            data += "<h2>Currently Building:</h2>\n"
-            data += "<ul>\n"
-            for build in current:
-                data += " <li>" + self.build_line(build, req) + "</li>\n"
-            data += "</ul>\n"
-        else:
-            data += "<h2>no current builds</h2>\n"
-
-        # Then a section with the last 5 builds, with the most recent build
-        # distinguished from the rest.
-
-        data += "<h2>Recent Builds:</h2>\n"
-        data += "<ul>\n"
-        numbuilds = req.args.get('numbuilds', ['5'])[0]
-        for i,build in enumerate(b.generateFinishedBuilds(num_builds=int(numbuilds))):
-            data += " <li>" + self.make_line(req, build, False) + "</li>\n"
-            if i == 0:
-                data += "<br />\n" # separator
-                # TODO: or empty list?
-        data += "</ul>\n"
-
-
-        data += "<h2>Buildslaves:</h2>\n"
-        data += "<ol>\n"
-        for slave in slaves:
-            slaveurl = path_to_slave(req, slave)
-            data += "<li><b><a href=\"%s\">%s</a></b>: " % (html.escape(slaveurl), html.escape(slave.getName()))
-            if slave.isConnected():
-                data += "CONNECTED\n"
-                if slave.getAdmin():
-                    data += make_row("Admin:", html.escape(slave.getAdmin()))
-                if slave.getHost():
-                    data += "<span class='label'>Host info:</span>\n"
-                    data += html.PRE(slave.getHost())
+            if pb.source.changes:
+                for c in pb.source.changes:
+                    changes.append({ 'url' : path_to_change(req, c),
+                                            'who' : c.who})
+            elif pb.source.revision:
+                reason = pb.source.revision
             else:
-                data += ("NOT CONNECTED\n")
-            data += "</li>\n"
-        data += "</ol>\n"
+                reason = "no changes specified"
+                    
+            cxt['pending'].append({
+                'when': time.strftime("%b %d %H:%M:%S", time.localtime(pb.getSubmitTime())),
+                'delay': util.formatInterval(util.now() - pb.getSubmitTime()),
+                'reason': reason,
+                'id': id(pb),
+                'changes' : changes
+                })
+
+        if self.builder_control is not None:
+            cxt['cancel_url'] = path_to_builder(req, b) + '/cancelbuild'
+                        
+        numbuilds = int(req.args.get('numbuilds', ['5'])[0])
+        recent = cxt['recent'] = []
+        for build in b.generateFinishedBuilds(num_builds=int(numbuilds)):
+            recent.append(self.get_line_values(req, build, False))
+
+        sl = cxt['slaves'] = []
+        for slave in slaves:
+            s = {}
+            sl.append(s)
+            s['link'] = path_to_slave(req, slave)
+            s['name'] = slave.getName()
+            c = s['connected'] = slave.isConnected()
+            if c:
+                s['admin'] = slave.getAdmin()
 
         if control is not None and connected_slaves:
-            forceURL = path_to_builder(req, b) + '/force'
-            data += make_force_build_form(forceURL, self.isUsingUserPasswd(req))
+            cxt['force_url'] = path_to_builder(req, b) + '/force'
+            cxt['use_user_passwd'] = self.isUsingUserPasswd(req)
         elif control is not None:
-            data += """
-            <p>All buildslaves appear to be offline, so it's not possible
-            to force this build to execute at this time.</p>
-            """
+            cxt['all_slaves_offline'] = True
 
         if control is not None:
-            pingURL = path_to_builder(req, b) + '/ping'
-            data += """
-            <form action="%s" class='command pingbuilder'>
-            <p>To ping the buildslave(s), push the 'Ping' button</p>
+            cxt['ping_url'] = path_to_builder(req, b) + '/ping'
 
-            <input type="submit" value="Ping Builder" />
-            </form>
-            """ % pingURL
-
-        data += self.footer(status, req)
-
-        return data
+        template = req.site.buildbot_service.templates.get_template("builder.html")
+        return template.render(**cxt)
 
     def force(self, req):
         """
@@ -146,7 +130,7 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         revision = req.args.get("revision", [""])[0]
 
         r = "The web-page 'force build' button was pressed by '%s': %s\n" \
-            % (name, reason)
+            % (html.escape(name), html.escape(reason))
         log.msg("web forcebuild of builder '%s', branch='%s', revision='%s'"
                 " by user '%s'" % (self.builder_status.getName(), branch,
                                    revision, name))
@@ -160,13 +144,16 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
             if not self.authUser(req):
                 return Redirect("../../authfail")
 
-        # keep weird stuff out of the branch and revision strings. TODO:
-        # centralize this somewhere.
+        # keep weird stuff out of the branch revision, and property strings.
+        # TODO: centralize this somewhere.
         if not re.match(r'^[\w\.\-\/]*$', branch):
             log.msg("bad branch '%s'" % branch)
             return Redirect("..")
         if not re.match(r'^[\w\.\-\/]*$', revision):
             log.msg("bad revision '%s'" % revision)
+            return Redirect("..")
+        properties = getAndCheckProperties(req)
+        if properties is None:
             return Redirect("..")
         if not branch:
             branch = None
@@ -181,7 +168,8 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         # buildbot.changes.changes.Change instance which is tedious at this
         # stage to compute
         s = SourceStamp(branch=branch, revision=revision)
-        req = BuildRequest(r, s, builderName=self.builder_status.getName())
+        req = BuildRequest(r, s, builderName=self.builder_status.getName(),
+                           properties=properties)
         try:
             self.builder_control.requestBuildSoon(req)
         except interfaces.NoSlaveError:
@@ -195,6 +183,25 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         log.msg("web ping of builder '%s'" % self.builder_status.getName())
         self.builder_control.ping() # TODO: there ought to be an ISlaveControl
         # send the user back to the builder page
+        return Redirect(".")
+
+    def cancel(self, req):
+        try:
+            request_id = req.args.get("id", [None])[0]
+            if request_id == "all":
+                cancel_all = True
+            else:
+                cancel_all = False
+                request_id = int(request_id)
+        except:
+            request_id = None
+        if request_id:
+            for build_req in self.builder_control.getPendingBuilds():
+                if cancel_all or id(build_req.original_request.status) == request_id:
+                    log.msg("Cancelling %s" % build_req)
+                    build_req.cancel()
+                    if not cancel_all:
+                        break
         return Redirect(".")
 
     def getChild(self, path, req):
@@ -222,6 +229,8 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
                     return static.Data(file, "text/html")
                 return static.Data(file, "text/plain")
             return file
+        if path == "cancelbuild":
+            return self.cancel(req)
         if path == "builds":
             return BuildsResource(self.builder_status, self.builder_control)
 
@@ -229,7 +238,7 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
 
 
 # /builders/_all
-class StatusResourceAllBuilders(HtmlResource, OneLineMixin):
+class StatusResourceAllBuilders(HtmlResource, BuildLineMixin):
 
     def __init__(self, status, control):
         HtmlResource.__init__(self)
@@ -286,24 +295,16 @@ class BuildersResource(HtmlResource):
     title = "Builders"
     addSlash = True
 
-    def body(self, req):
+    def content(self, req, ctx):
         s = self.getStatus(req)
-        data = ""
-        data += "<h1>Builders</h1>\n"
 
-        # TODO: this is really basic. It should be expanded to include a
-        # brief one-line summary of the builder (perhaps with whatever the
-        # builder is currently doing)
-        data += "<ol>\n"
+        ctx['builders'] = builders = []
         for bname in s.getBuilderNames():
-            data += (' <li><a href="%s">%s</a></li>\n' %
-                     (req.childLink(urllib.quote(bname, safe='')),
-                      bname))
-        data += "</ol>\n"
-
-        data += self.footer(s, req)
-
-        return data
+            builders.append({'link' : req.childLink(urllib.quote(bname, safe='')),
+                             'name' : bname})
+                      
+        template = req.site.buildbot_service.templates.get_template('builders.html')
+        return template.render(ctx)
 
     def getChild(self, path, req):
         s = self.getStatus(req)

@@ -150,7 +150,7 @@ class RealSlaveLock:
         return self.locks[slavename]
 
 
-class LockAccess:
+class LockAccess(util.ComparableMixin):
     """ I am an object representing a way to access a lock.
 
     @param lockid: LockId instance that should be accessed.
@@ -159,6 +159,8 @@ class LockAccess:
     @param mode: Mode of accessing the lock.
     @type  mode: A string, either 'counting' or 'exclusive'.
     """
+
+    compare_attrs = ['lockid', 'mode']
     def __init__(self, lockid, mode):
         self.lockid = lockid
         self.mode = mode

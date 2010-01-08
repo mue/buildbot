@@ -1,4 +1,3 @@
-
 import sys, os, time
 from cPickle import dump
 
@@ -9,22 +8,7 @@ from twisted.application import service
 from twisted.web import html
 
 from buildbot import interfaces, util
-
-html_tmpl = """
-<p>Changed by: <b>%(who)s</b><br />
-Changed at: <b>%(at)s</b><br />
-%(repository)s
-%(branch)s
-%(revision)s
-<br />
-
-Changed files:
-%(files)s
-
-Comments:
-%(comments)s
-</p>
-"""
+from buildbot.process.properties import Properties
 
 class Change:
     """I represent a single change to the source tree. This may involve
@@ -50,16 +34,18 @@ class Change:
 
     number = None
 
-    links = []
     branch = None
+    category = None
     revision = None # used to create a source-stamp
 
-    def __init__(self, who, files, comments, isdir=0, links=[],
+    def __init__(self, who, files, comments, isdir=0, links=None,
                  revision=None, when=None, branch=None, category=None,
-                 repository=None):
+                 repository=None, revlink='', properties={}):
         self.who = who
         self.comments = comments
         self.isdir = isdir
+        if links is None:
+            links = []
         self.links = links
         self.revision = revision
         if when is None:
@@ -68,66 +54,53 @@ class Change:
         self.branch = branch
         self.category = category
         self.repository = repository
+        self.revlink = revlink
+        self.properties = Properties()
+        self.properties.update(properties, "Change")
 
         # keep a sorted list of the files, for easier display
         self.files = files[:]
         self.files.sort()
 
+    def __setstate__(self, dict):
+        self.__dict__ = dict
+        # Older Changes won't have a 'properties' attribute in them
+        if not hasattr(self, 'properties'):
+            self.properties = Properties()
+
     def asText(self):
         data = ""
-        data += self.getFileContents() 
+        data += self.getFileContents()
         data += "At: %s\n" % self.getTime()
         data += "Changed By: %s\n" % self.who
-        data += "Comments: %s\n\n" % self.comments
+        data += "Comments: %s" % self.comments
+        data += "Properties: \n%s\n\n" % self.getProperties()
         return data
 
-    def asHTML(self):
-        links = []
+    def html_dict(self):
+        '''returns a dictonary with suitable info for html/mail rendering'''
+        files = []
         for file in self.files:
             link = filter(lambda s: s.find(file) != -1, self.links)
             if len(link) == 1:
-                # could get confused
-                links.append('<a href="%s"><b>%s</b></a>' % (link[0], file))
+                url = link[0]
             else:
-                links.append('<b>%s</b>' % file)
-        revision = ""
-        if self.revision:
-            revision = "Revision: <b>%s</b><br />\n" % self.revision
-        repository = ""
-        if self.repository:
-            repository = "Repository: <b>%s</b><br />\n" % self.repository
-        branch = ""
-        if self.branch:
-            branch = "Branch: <b>%s</b><br />\n" % self.branch
+                url = None
+            files.append(dict(url=url, name=file))
+        
+        files = sorted(files, cmp=lambda a,b: a['name'] < b['name'])
 
-        kwargs = { 'who'       : html.escape(self.who),
+        kwargs = { 'who'       : self.who,
                    'at'        : self.getTime(),
-                   'files'     : html.UL(links) + '\n',
-                   'revision'  : revision,
+                   'files'     : files,
+                   'revision'  : self.revision,
+                   'revlink'   : getattr(self, 'revlink', None),
                    'repository': repository,
-                   'branch'    : branch,
-                   'comments'  : html.PRE(self.comments) }
-        return html_tmpl % kwargs
+                   'branch'    : self.branch,
+                   'comments'  : self.comments,
+                   'properties': self.properties.asList() }
 
-    def get_HTML_box(self, url):
-        """Return the contents of a TD cell for the waterfall display.
-
-        @param url: the URL that points to an HTML page that will render
-        using our asHTML method. The Change is free to use this or ignore it
-        as it pleases.
-
-        @return: the HTML that will be put inside the table cell. Typically
-        this is just a single href named after the author of the change and
-        pointing at the passed-in 'url'.
-        """
-        who = self.getShortAuthor()
-        if self.comments is None:
-            title = ""
-        else:
-            title = html.escape(self.comments)
-        return '<a href="%s" title="%s">%s</a>' % (url,
-                                                   title,
-                                                   html.escape(who))
+        return kwargs
 
     def getShortAuthor(self):
         return self.who
@@ -159,6 +132,12 @@ class Change:
                 data += " %s\n" % f
         return data
         
+    def getProperties(self):
+        data = ""
+        for prop in self.properties.asList():
+            data += "  %s: %s" % (prop[0], prop[1])
+        return data
+
 class ChangeMaster(service.MultiService):
 
     """This is the master-side service which receives file change
@@ -198,6 +177,8 @@ class ChangeMaster(service.MultiService):
     debug = False
     # todo: use Maildir class to watch for changes arriving by mail
 
+    changeHorizon = 0
+
     def __init__(self):
         service.MultiService.__init__(self)
         self.changes = []
@@ -233,15 +214,18 @@ class ChangeMaster(service.MultiService):
         self.nextNumber += 1
         self.changes.append(change)
         self.parent.addChange(change)
-        # TODO: call pruneChanges after a while
+        self.pruneChanges()
 
     def pruneChanges(self):
-        self.changes = self.changes[-100:] # or something
+        if self.changeHorizon and len(self.changes) > self.changeHorizon:
+            log.msg("pruning %i changes" % (len(self.changes) - self.changeHorizon))
+            self.changes = self.changes[-self.changeHorizon:]
 
-    def eventGenerator(self, branches=[]):
+    def eventGenerator(self, branches=[], categories=[]):
         for i in range(len(self.changes)-1, -1, -1):
             c = self.changes[i]
-            if not branches or c.branch in branches:
+            if (not branches or c.branch in branches) and (
+                not categories or c.category in categories):
                 yield c
 
     def getChangeNumbered(self, num):
@@ -259,7 +243,10 @@ class ChangeMaster(service.MultiService):
             return None
         offset = num - first
         log.msg(self, "offset", offset)
-        return self.changes[offset]
+        if 0 <= offset <= len(self.changes):
+            return self.changes[offset]
+        else:
+            return None
 
     def __getstate__(self):
         d = service.MultiService.__getstate__(self)

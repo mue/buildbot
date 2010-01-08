@@ -33,13 +33,18 @@ from twisted.spread import pb
 from twisted.cred import credentials
 from twisted.internet import reactor
 
-from buildbot.scripts import runner
 from optparse import OptionParser
 
 # Modify this to fit your setup, or pass in --master server:host on the
 # command line
 
 master = "localhost:9989"
+
+# When sending the notification, send this category iff
+# it's set (via --category)
+
+category = None
+
 
 # The GIT_DIR environment variable must have been set up so that any
 # git commands that are executed will operate on the repository we're
@@ -54,7 +59,7 @@ def connectFailed(error):
     return error
 
 
-def addChange(dummy, remote, changei):
+def addChange(remote, changei):
     logging.debug("addChange %s, %s" % (repr(remote), repr(changei)))
     try:
         c = changei.next()
@@ -67,12 +72,17 @@ def addChange(dummy, remote, changei):
         logging.debug("  %s: %s" % (key, value))
 
     d = remote.callRemote('addChange', c)
-    d.addCallback(addChange, remote, changei)
+
+    # tail recursion in Twisted can blow out the stack, so we
+    # insert a callLater to delay things
+    def recurseLater(x):
+        reactor.callLater(0, addChange, remote, changei)
+    d.addCallback(recurseLater)
     return d
 
 
 def connected(remote):
-    return addChange(None, remote, changes.__iter__())
+    return addChange(remote, changes.__iter__())
 
 
 def grab_commit_info(c, rev):
@@ -119,6 +129,8 @@ def gen_changes(input, branch):
              'comments': m.group(2),
              'branch': branch,
         }
+        if category:
+            c['category'] = category
         grab_commit_info(c, m.group(1))
         changes.append(c)
 
@@ -180,6 +192,9 @@ def gen_update_branch_changes(oldrev, newrev, refname, branch):
         status = f.close()
         if status:
             logging.warning("git diff exited with status %d" % status)
+
+        if category:
+            c['category'] = category
 
         if files:
             c['files'] = files
@@ -256,6 +271,8 @@ def parse_options():
                    { 'master' : master })
     parser.add_option("-m", "--master", action="store", type="string",
             help=master_help)
+    parser.add_option("-c", "--category", action="store",
+                      type="string", help="Scheduler category to notify.")
     options, args = parser.parse_args()
     return options
 
@@ -286,6 +303,9 @@ try:
 
     if options.master:
         master=options.master
+
+    if options.category:
+        category = options.category
 
     process_changes()
 except SystemExit:

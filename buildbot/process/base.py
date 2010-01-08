@@ -240,12 +240,6 @@ class Build:
     def __repr__(self):
         return "<Build %s>" % (self.builder.name,)
 
-    def __getstate__(self):
-        d = self.__dict__.copy()
-        if d.has_key('remote'):
-            del d['remote']
-        return d
-
     def blamelist(self):
         blamelist = []
         for c in self.allChanges():
@@ -290,6 +284,10 @@ class Build:
         # which schedulers will send us properties)
         for rq in self.requests:
             props.updateFromProperties(rq.properties)
+
+        # and finally, from the SourceStamp, which has properties via Change
+        for change in self.source.changes:
+            props.updateFromProperties(change.properties)
 
         # now set some properties of our own, corresponding to the
         # build itself
@@ -351,8 +349,9 @@ class Build:
             self.setupBuild(expectations) # create .steps
         except:
             # the build hasn't started yet, so log the exception as a point
-            # event instead of flunking the build. TODO: associate this
-            # failure with the build instead. this involves doing
+            # event instead of flunking the build. 
+            # TODO: associate this failure with the build instead. 
+            # this involves doing
             # self.build_status.buildStarted() from within the exception
             # handler
             log.msg("Build.setupBuild failed")

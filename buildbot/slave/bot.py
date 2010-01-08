@@ -86,7 +86,7 @@ class SlaveBuilder(pb.Referenceable, service.Service):
         self.builddir = builddir
         self.basedir = os.path.join(self.bot.basedir, self.builddir)
         if not os.path.isdir(self.basedir):
-            os.mkdir(self.basedir)
+            os.makedirs(self.basedir)
 
     def stopService(self):
         service.Service.stopService(self)
@@ -338,6 +338,12 @@ class Bot(pb.Referenceable, service.MultiService):
             if os.path.isfile(filename):
                 files[f] = open(filename, "r").read()
         return files
+
+    def remote_getVersion(self):
+        """Send our version back to the Master"""
+        return buildbot.version
+
+
 
 class BotFactory(ReconnectingPBClientFactory):
     # 'keepaliveInterval' serves two purposes. The first is to keep the

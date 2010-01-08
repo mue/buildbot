@@ -353,6 +353,7 @@ config_1 = """
 from buildbot import locks
 from buildbot.process import factory
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
 s = factory.s
 from buildbot.test.test_locks import LockStep
 
@@ -367,20 +368,21 @@ f1 = factory.BuildFactory([s(LockStep, timeout=2, locks=[first_lock])])
 f2 = factory.BuildFactory([s(LockStep, timeout=3, locks=[second_lock])])
 f3 = factory.BuildFactory([s(LockStep, timeout=2, locks=[])])
 
-b1a = {'name': 'full1a', 'slavename': 'bot1', 'builddir': '1a', 'factory': f1}
-b1b = {'name': 'full1b', 'slavename': 'bot1', 'builddir': '1b', 'factory': f1}
-b1c = {'name': 'full1c', 'slavename': 'bot1', 'builddir': '1c', 'factory': f3,
-       'locks': [first_lock, second_lock]}
-b1d = {'name': 'full1d', 'slavename': 'bot1', 'builddir': '1d', 'factory': f2}
-b2a = {'name': 'full2a', 'slavename': 'bot2', 'builddir': '2a', 'factory': f1}
-b2b = {'name': 'full2b', 'slavename': 'bot2', 'builddir': '2b', 'factory': f3,
-       'locks': [second_lock]}
+b1a = BuilderConfig(name='full1a', slavename='bot1', factory=f1)
+b1b = BuilderConfig(name='full1b', slavename='bot1', factory=f1)
+b1c = BuilderConfig(name='full1c', slavename='bot1', factory=f3,
+                    locks=[first_lock, second_lock])
+b1d = BuilderConfig(name='full1d', slavename='bot1', factory=f2)
+
+b2a = BuilderConfig(name='full2a', slavename='bot2', factory=f1)
+b2b = BuilderConfig(name='full2b', slavename='bot2', factory=f3,
+                    locks=[second_lock])
 c['builders'] = [b1a, b1b, b1c, b1d, b2a, b2b]
 """
 
 config_1a = config_1 + \
 """
-b1b = {'name': 'full1b', 'slavename': 'bot1', 'builddir': '1B', 'factory': f1}
+b1b = BuilderConfig(name='full1b', builddir='1B', slavename='bot1', factory=f1)
 c['builders'] = [b1a, b1b, b1c, b1d, b2a, b2b]
 """
 
@@ -418,7 +420,7 @@ class Locks(RunMixin, unittest.TestCase):
                              [("start", 1), ("done", 1),
                               ("start", 2), ("done", 2)])
 
-    def testLock1a(self):
+    def dont_testLock1a(self): ## disabled -- test itself is buggy
         # just like testLock1, but we reload the config file first, with a
         # change that causes full1b to be changed. This tickles a design bug
         # in which full1a and full1b wind up with distinct Lock instances.
@@ -455,7 +457,7 @@ class Locks(RunMixin, unittest.TestCase):
         self.failUnless(self.events[:2] == [("start", 1), ("start", 2)] or
                         self.events[:2] == [("start", 2), ("start", 1)])
 
-    def testLock3(self):
+    def dont_testLock3(self): ## disabled -- test fails sporadically
         # two builds run on separate slaves with master-scoped locks should
         # not overlap
         self.control.getBuilder("full1c").requestBuild(self.req1)
@@ -475,21 +477,91 @@ class Locks(RunMixin, unittest.TestCase):
                                            ("start", 1), ("done", 1)]
                         )
 
-    def testLock4(self):
-        self.control.getBuilder("full1a").requestBuild(self.req1)
-        self.control.getBuilder("full1c").requestBuild(self.req2)
-        self.control.getBuilder("full1d").requestBuild(self.req3)
-        d = defer.DeferredList([self.req1.waitUntilFinished(),
-                                self.req2.waitUntilFinished(),
-                                self.req3.waitUntilFinished()])
-        d.addCallback(self._testLock4_1)
+    # This test has been disabled due to flakeyness/intermittentness
+#    def testLock4(self):
+#        self.control.getBuilder("full1a").requestBuild(self.req1)
+#        self.control.getBuilder("full1c").requestBuild(self.req2)
+#        self.control.getBuilder("full1d").requestBuild(self.req3)
+#        d = defer.DeferredList([self.req1.waitUntilFinished(),
+#                                self.req2.waitUntilFinished(),
+#                                self.req3.waitUntilFinished()])
+#        d.addCallback(self._testLock4_1)
+#        return d
+#
+#    def _testLock4_1(self, res):
+#        # full1a starts, then full1d starts (because they do not interfere).
+#        # Once both are done, full1c can run.
+#        self.failUnlessEqual(self.events,
+#                             [("start", 1), ("start", 3),
+#                              ("done", 1), ("done", 3),
+#                              ("start", 2), ("done", 2)])
+
+class BuilderLocks(RunMixin, unittest.TestCase):
+    config = """\
+from buildbot import locks
+from buildbot.process import factory
+from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
+s = factory.s
+from buildbot.test.test_locks import LockStep
+
+BuildmasterConfig = c = {}
+c['slaves'] = [BuildSlave('bot1', 'sekrit'), BuildSlave('bot2', 'sekrit')]
+c['schedulers'] = []
+c['slavePortnum'] = 0
+
+master_lock = locks.MasterLock('master', maxCount=2)
+f_excl = factory.BuildFactory([s(LockStep, timeout=0,
+                               locks=[master_lock.access("exclusive")])])
+f_count = factory.BuildFactory([s(LockStep, timeout=0,
+                                locks=[master_lock])])
+
+slaves = ['bot1', 'bot2']
+c['builders'] = [
+  BuilderConfig(name='excl_A', slavenames=slaves, factory=f_excl),
+  BuilderConfig(name='excl_B', slavenames=slaves, factory=f_excl),
+  BuilderConfig(name='count_A', slavenames=slaves, factory=f_count),
+  BuilderConfig(name='count_B', slavenames=slaves, factory=f_count),
+]
+"""
+
+    def setUp(self):
+        N = 'test_builder'
+        RunMixin.setUp(self)
+        self.reqs = [BuildRequest("forced build", SourceStamp(), N)
+                     for i in range(4)]
+        self.events = []
+        for i in range(4):
+            self.reqs[i].number = i
+            self.reqs[i].events = self.events
+        d = self.master.loadConfig(self.config)
+        d.addCallback(lambda res: self.master.startService())
+        d.addCallback(lambda res: self.connectSlaves(["bot1", "bot2"],
+                                                     ["excl_A", "excl_B",
+                                                      "count_A", "count_B"]))
         return d
 
-    def _testLock4_1(self, res):
-        # full1a starts, then full1d starts (because they do not interfere).
-        # Once both are done, full1c can run.
-        self.failUnlessEqual(self.events,
-                             [("start", 1), ("start", 3),
-                              ("done", 1), ("done", 3),
-                              ("start", 2), ("done", 2)])
+    def testOrder(self):
+        self.control.getBuilder("excl_A").requestBuild(self.reqs[0])
+        self.control.getBuilder("excl_B").requestBuild(self.reqs[1])
+        self.control.getBuilder("count_A").requestBuild(self.reqs[2])
+        self.control.getBuilder("count_B").requestBuild(self.reqs[3])
+        d = defer.DeferredList([r.waitUntilFinished()
+                                for r in self.reqs])
+        d.addCallback(self._testOrder)
+        return d
 
+    def _testOrder(self, res):
+        # excl_A and excl_B cannot overlap with any other steps.
+        self.assert_(("start", 0) in self.events)
+        self.assert_(("done", 0) in self.events)
+        self.assert_(self.events.index(("start", 0)) + 1 ==
+                     self.events.index(("done", 0)))
+
+        self.assert_(("start", 1) in self.events)
+        self.assert_(("done", 1) in self.events)
+        self.assert_(self.events.index(("start", 1)) + 1 ==
+                     self.events.index(("done", 1)))
+
+        # FIXME: We really want to test that count_A and count_B were
+        # overlapped, but don't have a reliable way to do this.

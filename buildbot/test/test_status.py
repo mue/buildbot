@@ -10,16 +10,23 @@ from twisted.trial import unittest
 from buildbot import interfaces
 from buildbot.sourcestamp import SourceStamp
 from buildbot.process.base import BuildRequest, Build
-from buildbot.status import builder, base, words, progress
+from buildbot.status import builder, base, words
 from buildbot.changes.changes import Change
 from buildbot.process.builder import Builder
 from time import sleep
+
+import jinja2
+
+import sys
+if sys.version_info[:3] < (2,4,0):
+    from sets import Set as set
 
 mail = None
 try:
     from buildbot.status import mail
 except ImportError:
     pass
+
 from buildbot.status import progress, client # NEEDS COVERAGE
 from buildbot.test.runutils import RunMixin, setupBuildStepStatus, rmtree
 
@@ -146,12 +153,21 @@ def customTextMailMessage(attrs):
     return ("\n".join(text), 'plain')
 
 def customHTMLMailMessage(attrs):
+    loader = jinja2.PackageLoader('buildbot.status.web', 'templates')
+    templates = jinja2.Environment(loader=loader,
+                                extensions=['jinja2.ext.i18n'],
+                                trim_blocks=True)
+    template = templates.get_template("change.html")
+
+    
     logLines = 3
     text = list()
     text.append("<h3>STATUS <a href='%s'>%s</a>:</h3>" % (attrs['buildURL'],
                                                           attrs['result'].title()))
-    text.append("<h4>Recent Changes:</h4>")
-    text.extend([c.asHTML() for c in attrs['changes']])
+    text.append("<h4>Recent Changes:</h4>")   
+    for c in attrs['changes']: 
+        text.append(template.module.change(**c.html_dict()))
+                    
     name, url, lines, status = attrs['logs'][-1]
     text.append("<h4>Last %d lines of '%s':</h4>" % (logLines, name))
     text.append("<p>")
@@ -194,7 +210,7 @@ class Mail(unittest.TestCase):
                                            "recip2@example.com"],
                           lookup=mail.Domain("dev.com"))
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(3, builder.SUCCESS)
@@ -219,7 +235,7 @@ class Mail(unittest.TestCase):
                           lookup="dev.com",
                           sendToInterestedUsers=False)
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(3, builder.SUCCESS)
@@ -247,7 +263,7 @@ class Mail(unittest.TestCase):
                           categories=["debug"])
 
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(3, builder.SUCCESS)
@@ -280,11 +296,11 @@ class Mail(unittest.TestCase):
         builderd = MyBuilder("builder2", "debug")
 
         mailer1.parent = self
-        mailer1.status = self
+        mailer1.master_status = self
         mailer2.parent = self
-        mailer2.status = self
+        mailer2.master_status = self
         mailer3.parent = self
-        mailer3.status = self
+        mailer3.master_status = self
         self.messages = []
 
         t = mailer1.builderAdded("builder2", builderd)
@@ -318,7 +334,7 @@ class Mail(unittest.TestCase):
                           lookup=MyLookup(),
                           customMesg=customTextMailMessage)
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(4, builder.FAILURE)
@@ -353,7 +369,7 @@ class Mail(unittest.TestCase):
                           lookup=MyLookup(),
                           customMesg=customHTMLMailMessage)
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(4, builder.FAILURE)
@@ -374,7 +390,7 @@ class Mail(unittest.TestCase):
         #
         #self.fail(t)
         self.failUnlessIn("<h4>Last 3 lines of 'step.test':</h4>", t)
-        self.failUnlessIn("<p>Changed by: <b>author2</b><br />", t)
+        self.failUnlessIn("Changed by: <b>author2</b>", t)
         self.failUnlessIn("Test 3 failed", t)
         self.failUnlessIn("number was: 1", t)
 
@@ -387,13 +403,55 @@ class Mail(unittest.TestCase):
         self.assertFalse(mailer._shouldAttachLog('anything'))
         self.assertTrue(mailer._shouldAttachLog('something'))
 
+    def testShouldAttachPatches(self):
+        basedir = "test_should_attach_patches"
+        os.mkdir(basedir)
+        b1 = self.makeBuild(4, builder.FAILURE)
+        b1.setProperty('buildnumber', 1, 'Build')
+        b1.setText(["snarkleack", "polarization", "failed"])
+        b1.blamelist = ["dev3", "dev3", "dev3", "dev4",
+                        "Thomas_Walters"]
+        b1.source.changes = (Change(who = 'author1', files = ['file1'], comments = 'comment1', revision = 123),
+                             Change(who = 'author2', files = ['file2'], comments = 'comment2', revision = 456))
+        b1.testlogs = [MyLog(basedir, 'compile', "Compile log here\n"),
+                       MyLog(basedir, 'test', "Test log here\nTest 1 failed\nTest 2 failed\nTest 3 failed\nTest 4 failed\n")]
+        b1.source.patch = (0, '--- /dev/null\n+++ a_file\n', None)
+
+        mailer = MyMailer(fromaddr="buildbot@example.com", addPatch=True)
+        mailer.parent = self
+        mailer.master_status = self
+        self.messages = []
+        mailer.buildFinished("builder1", b1, b1.results)
+        m,r = self.messages.pop()
+        self.assertTrue(m.is_multipart())
+        self.assertEqual(len([True for i in m.walk()]), 3)
+
+        mailer = MyMailer(fromaddr="buildbot@example.com", addPatch=False)
+        mailer.parent = self
+        mailer.master_status = self
+        self.messages = []
+        mailer.buildFinished("builder1", b1, b1.results)
+        m,r = self.messages.pop()
+        self.assertFalse(m.is_multipart())
+        self.assertEqual(len([True for i in m.walk()]), 1)
+
+        mailer = MyMailer(fromaddr="buildbot@example.com")
+        mailer.parent = self
+        mailer.master_status = self
+        self.messages = []
+        mailer.buildFinished("builder1", b1, b1.results)
+        m,r = self.messages.pop()
+        self.assertTrue(m.is_multipart())
+        self.assertEqual(len([True for i in m.walk()]), 3)
+
+
     def testFailure(self):
         mailer = MyMailer(fromaddr="buildbot@example.com", mode="problem",
                           extraRecipients=["recip@example.com",
                                            "recip2@example.com"],
                           lookup=MyLookup())
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(3, builder.SUCCESS)
@@ -417,6 +475,45 @@ class Mail(unittest.TestCase):
         self.failUnlessEqual(set(r), set(["dev3@dev.com", "dev4@dev.com",
                                  "recip2@example.com", "recip@example.com"]))
 
+    
+    def testChange(self):
+        raise unittest.SkipTest("TODO: Fix Build/Builder mock objects to support getPrevBuild()")
+    
+        mailer = MyMailer(fromaddr="buildbot@example.com", mode="change",
+                          extraRecipients=["bah@bah.bah"],
+                          lookup=MyLookup())
+        mailer.parent = self
+        mailer.master_status = self
+        self.messages = []
+        
+        b1 = self.makeBuild(1, builder.SUCCESS)
+        b2 = self.makeBuild(2, builder.SUCCESS)
+        b3 = self.makeBuild(3, builder.FAILURE)
+        b4 = self.makeBuild(4, builder.FAILURE)
+        b5 = self.makeBuild(5, builder.SUCCESS)
+        b6 = self.makeBuild(6, builder.SUCCESS)
+        
+        # no message on first or repetetive success
+        mailer.buildFinished("builder1", b1, b1.results)
+        self.failIf(self.messages)
+        mailer.buildFinished("builder1", b2, b2.results)
+        self.failIf(self.messages)
+        
+        # message on first fail only
+        mailer.buildFinished("builder1", b3, b3.results)
+        self.failUnless(len(self.messages) == 1)
+        self.messages.pop()
+        mailer.buildFinished("builder1", b4, b4.results)
+        self.failIf(self.messages)
+
+        # message on first following success
+        mailer.buildFinished("builder1", b5, b5.results)
+        self.failUnless(len(self.messages) == 1)
+        self.messages.pop()
+        mailer.buildFinished("builder1", b6, b6.results)
+        self.failIf(self.messages)
+
+
     def testLogs(self):
         basedir = "test_status_logs"
         os.mkdir(basedir)
@@ -424,7 +521,7 @@ class Mail(unittest.TestCase):
                           extraRecipients=["recip@example.com",
                                            "recip2@example.com"])
         mailer.parent = self
-        mailer.status = self
+        mailer.master_status = self
         self.messages = []
 
         b1 = self.makeBuild(3, builder.WARNINGS)
@@ -462,7 +559,7 @@ class Mail(unittest.TestCase):
                                    extraRecipients=[dest])
         s = MyStatus()
         s.url = "project URL"
-        mailer.status = s
+        mailer.master_status = s
 
         b1 = self.makeBuild(3, builder.SUCCESS)
         b1.testlogs = [MyLog(basedir, 'compile', "Compile log here\n"),
@@ -587,11 +684,11 @@ class Log(unittest.TestCase):
     def testMerge2(self):
         l = MyLog(self.basedir, "merge2")
         l.addHeader("HEADER\n")
-        for i in xrange(1000):
+        for _ in xrange(1000):
             l.addStdout("aaaa")
-        for i in xrange(30):
+        for _ in xrange(30):
             l.addStderr("bbbb")
-        for i in xrange(10):
+        for _ in xrange(10):
             l.addStdout("cc")
         target = 1000*"aaaa" + 30 * "bbbb" + 10 * "cc"
         self.failUnlessEqual(len(l.getText()), len(target))
@@ -605,9 +702,9 @@ class Log(unittest.TestCase):
         l = MyLog(self.basedir, "merge3")
         l.chunkSize = 100
         l.addHeader("HEADER\n")
-        for i in xrange(8):
+        for _ in xrange(8):
             l.addStdout(10*"a")
-        for i in xrange(8):
+        for _ in xrange(8):
             l.addStdout(10*"a")
         self.failUnlessEqual(list(l.getChunks()),
                              [(builder.HEADER, "HEADER\n"),
@@ -789,8 +886,7 @@ class Log(unittest.TestCase):
         l2.addStdout(800*"a") # should now have two chunks on disk, 1000+600
         l2.addStdout(800*"b") # HEADER,1000+600*a on disk, 800*a in memory
         l2.addStdout(800*"b") # HEADER,1000+600*a,1000+600*b on disk
-        l2.addStdout(200*"c") # HEADER,1000+600*a,1000+600*b on disk,
-                              # 200*c in memory
+        l2.addStdout(200*"c") # HEADER,1000+600*a,1000+600*b on disk, 200*c in memory
         
         s = MyLogConsumer(limit=1)
         d = l2.subscribeConsumer(s)
@@ -856,8 +952,26 @@ class Log(unittest.TestCase):
         return d
     testLargeSummary.timeout = 5
 
+    def testLimit(self):
+        l = MyLog(self.basedir, "limit")
+        l.logMaxSize = 150
+        for i in range(1000):
+            l.addStdout("Some data")
+        l.finish()
+        t = l.getText()
+        # Compare against 175 since we truncate logs based on chunks, so we may
+        # go slightly over the limit
+        self.failIf(len(t) > 175, "Text too long (%i)" % len(t))
+        self.failUnless("truncated" in l.getTextWithHeaders(),
+                "No truncated message found")
 
 class CompressLog(unittest.TestCase):
+    # compression is not supported unless bz2 is installed
+    try:
+        import bz2 #@UnusedImport
+    except:
+        skip = "compression not supported (no bz2 module available)"
+
     def testCompressLogs(self):
         bss = setupBuildStepStatus("test-compress")
         bss.build.builder.setLogCompressionLimit(1024)
@@ -889,6 +1003,7 @@ config_base = """
 from buildbot.process import factory
 from buildbot.steps import dummy
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
 s = factory.s
 
 f1 = factory.QuickBuildFactory('fakerep', 'cvsmodule', configure=None)
@@ -901,17 +1016,18 @@ f2 = factory.BuildFactory([
 BuildmasterConfig = c = {}
 c['slaves'] = [BuildSlave('bot1', 'sekrit')]
 c['schedulers'] = []
-c['builders'] = []
-c['builders'].append({'name':'quick', 'slavename':'bot1',
-                      'builddir': 'quickdir', 'factory': f1})
+c['builders'] = [
+    BuilderConfig(name='quick', slavename='bot1', factory=f1),
+]
 c['slavePortnum'] = 0
 """
 
 config_2 = config_base + """
-c['builders'] = [{'name': 'dummy', 'slavename': 'bot1',
-                  'builddir': 'dummy1', 'factory': f2},
-                 {'name': 'testdummy', 'slavename': 'bot1',
-                  'builddir': 'dummy2', 'factory': f2, 'category': 'test'}]
+c['builders'] = [
+    BuilderConfig(name='dummy', slavename='bot1', factory=f2),
+    BuilderConfig(name='testdummy', slavename='bot1',
+                  factory=f2, category='test'),
+]
 """
 
 class STarget(base.StatusReceiver):
@@ -1277,8 +1393,10 @@ class ContactTester(unittest.TestCase):
         self.failUnlessEqual(irc.message, "", "No started notification with notify_events=['failed']")
 
         irc.message = ""
+        irc.channel.showBlameList = True
         irc.buildFinished(my_builder.getName(), my_build, None)
-        self.failUnlessEqual(irc.message, "build #862 of builder834 is complete: Failure [step1 step2]  Build details are at http://myserver/mypath?build=765", "Finish notification generated on failure with notify_events=['failed']")
+        self.failUnlessEqual(irc.message, "build #862 of builder834 is complete: Failure [step1 step2]  Build details are at http://myserver/mypath?build=765  blamelist: author1", "Finish notification generated on failure with notify_events=['failed']")
+        irc.channel.showBlameList = False
 
         irc.message = ""
         my_build.results = builder.SUCCESS
@@ -1308,6 +1426,12 @@ class ContactTester(unittest.TestCase):
         irc.message = ""
         irc.buildFinished(my_builder.getName(), my_build, None)
         self.failUnlessEqual(irc.message, "build #862 of builder834 is complete: Exception [step1 step2]  Build details are at http://myserver/mypath?build=765", "Finish notification generated on failure with notify_events=['exception']")
+
+        irc.message = ""
+        irc.channel.showBlameList = True
+        irc.buildFinished(my_builder.getName(), my_build, None)
+        self.failUnlessEqual(irc.message, "build #862 of builder834 is complete: Exception [step1 step2]  Build details are at http://myserver/mypath?build=765  blamelist: author1", "Finish notification generated on failure with notify_events=['exception']")
+        irc.channel.showBlameList = False
 
         irc.message = ""
         my_build.results = builder.SUCCESS
@@ -1548,6 +1672,7 @@ class MyChannel:
 
     def __init__(self, notify_events = {}):
         self.notify_events = notify_events
+        self.showBlameList = False
 
 class MyContact(words.Contact):
     message = ""
@@ -1564,6 +1689,31 @@ class MyContact(words.Contact):
 
     def send(self, msg):
         self.message += msg
+
+class MyIrcStatusBot(words.IrcStatusBot):
+    def msg(self, dest, message):
+        self.message = ['msg', dest, message]
+
+    def notice(self, dest, message):
+        self.message = ['notice', dest, message]
+
+class IrcStatusBotTester(unittest.TestCase):
+    def testMsgOrNotice(self):
+        channel = MyIrcStatusBot('alice', 'pa55w0od', ['#here'],
+                                 builder.SUCCESS, None, {})
+        channel.msgOrNotice('bob', 'hello')
+        self.failUnlessEqual(channel.message, ['msg', 'bob', 'hello'])
+
+        channel.msgOrNotice('#here', 'hello')
+        self.failUnlessEqual(channel.message, ['msg', '#here', 'hello'])
+
+        channel.noticeOnChannel = True
+
+        channel.msgOrNotice('bob', 'hello')
+        self.failUnlessEqual(channel.message, ['msg', 'bob', 'hello'])
+
+        channel.msgOrNotice('#here', 'hello')
+        self.failUnlessEqual(channel.message, ['notice', '#here', 'hello'])
 
 class StepStatistics(unittest.TestCase):
     def testStepStatistics(self):
@@ -1610,6 +1760,7 @@ class BuildExpectation(unittest.TestCase):
             Builder.__init__(self, {
                     'name': name,
                     'builddir': '/tmp/somewhere',
+                    'slavebuilddir': '/tmp/somewhere_else',
                     'factory': 'aFactory'
                     }, BuildExpectation.MyBuilderStatus())
 

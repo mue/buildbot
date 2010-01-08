@@ -1,4 +1,5 @@
 # -*- test-case-name: buildbot.test.test_web -*-
+# -*- coding: utf-8 -*-
 
 import os, time, shutil
 import warnings
@@ -14,7 +15,7 @@ from twisted.web import client
 
 from buildbot import master, interfaces, sourcestamp
 from buildbot.status import html, builder
-from buildbot.status.web import waterfall
+from buildbot.status.web import waterfall, xmlrpc
 from buildbot.changes.changes import Change
 from buildbot.process import base
 from buildbot.process.buildstep import BuildStep
@@ -41,15 +42,17 @@ from buildbot.status import html
 from buildbot.buildslave import BuildSlave
 from buildbot.scheduler import Scheduler
 from buildbot.process.factory import BuildFactory
+from buildbot.config import BuilderConfig
 
 BuildmasterConfig = c = {
     'change_source': PBChangeSource(),
     'slaves': [BuildSlave('bot1name', 'bot1passwd')],
     'schedulers': [Scheduler('name', None, 60, ['builder1'])],
-    'builders': [{'name': 'builder1', 'slavename': 'bot1name',
-                  'builddir': 'builder1', 'factory': BuildFactory()}],
     'slavePortnum': 0,
     }
+c['builders'] = [
+    BuilderConfig(name='builder1', slavename='bot1name', factory=BuildFactory()),
+]
 """
 
 
@@ -193,7 +196,7 @@ class Ports(BaseWeb, unittest.TestCase):
 
         d = client.getPage("http://localhost:%d/remote/waterfall" % p.portnum)
         def _check(page):
-            self.failUnlessIn("BuildBot", page)
+            self.failUnlessIn("http://buildbot.net", page)
         d.addCallback(_check)
         def _done(res):
             d1 = p.shutdown()
@@ -225,27 +228,26 @@ class Waterfall(BaseWeb, unittest.TestCase):
         config1 = base_config + """
 from buildbot.changes import mail
 c['change_source'] = mail.SyncmailMaildirSource('my-maildir')
-c['status'] = [html.Waterfall(http_port=0, robots_txt=%s)]
-""" % repr(self.robots_txt)
+c['status'] = [html.WebStatus(http_port=0)]
+"""
 
         self.master = m = ConfiguredMaster("test_web4", config1)
         m.startService()
-        port = self.find_waterfall(m).getPortnum()
+        port = self.find_webstatus(m).getPortnum()
         self.port = port
         # insert an event
         m.change_svc.addChange(Change("user", ["foo.c"], "comments"))
 
-        d = client.getPage("http://localhost:%d/" % port)
+        d = client.getPage("http://localhost:%d/waterfall" % port)
 
         def _check1(page):
             self.failUnless(page)
             self.failUnlessIn("current activity", page)
             self.failUnlessIn("<html", page)
             TZ = time.tzname[time.localtime()[-1]]
-            self.failUnlessIn("time (%s)" % TZ, page)
+            self.failUnlessIn("(%s)" % TZ, page)
 
-            # phase=0 is really for debugging the waterfall layout
-            return client.getPage("http://localhost:%d/?phase=0" % self.port)
+            return client.getPage("http://localhost:%d/waterfall" % self.port)
         d.addCallback(_check1)
 
         def _check2(page):
@@ -256,15 +258,10 @@ c['status'] = [html.Waterfall(http_port=0, robots_txt=%s)]
         d.addCallback(_check2)
 
         def _check3(changes):
-            self.failUnlessIn("<li>Syncmail mailing list in maildir " +
-                              "my-maildir</li>", changes)
+            self.failUnlessIn("Syncmail mailing list in maildir " +
+                              "my-maildir", changes)
 
-            return client.getPage("http://localhost:%d/robots.txt" % self.port)
         d.addCallback(_check3)
-
-        def _check4(robotstxt):
-            self.failUnless(robotstxt == self.robots_txt_contents)
-        d.addCallback(_check4)
 
         return d
 
@@ -288,18 +285,31 @@ class WaterfallSteps(unittest.TestCase):
         s = setupBuildStepStatus("test_web.test_urls")
         s.addURL("coverage", "http://coverage.example.org/target")
         s.addURL("icon", "http://coverage.example.org/icon.png")
+
+
+        class FakeService:
+            import jinja2
+            templates = jinja2.Environment(loader=jinja2.PackageLoader('buildbot.status.web', 'templates'),
+                                       extensions=['jinja2.ext.i18n'],
+                                       trim_blocks=True)
+        
+        class FakeSite:
+            buildbot_service = FakeService()        
+        
         class FakeRequest:
+            site = FakeSite()
             prepath = []
             postpath = []
             def childLink(self, name):
                 return name
+
         req = FakeRequest()
         box = waterfall.IBox(s).getBox(req)
-        td = box.td()
+        text = box.td()['text']
         e1 = '[<a href="http://coverage.example.org/target" class="BuildStep external">coverage</a>]'
-        self.failUnlessSubstring(e1, td)
+        self.failUnlessSubstring(e1, text)
         e2 = '[<a href="http://coverage.example.org/icon.png" class="BuildStep external">icon</a>]'
-        self.failUnlessSubstring(e2, td)
+        self.failUnlessSubstring(e2, text)
 
 
 
@@ -311,6 +321,7 @@ from buildbot.steps import dummy
 from buildbot.scheduler import Scheduler
 from buildbot.changes.base import ChangeSource
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
 s = factory.s
 
 class DiscardScheduler(Scheduler):
@@ -329,9 +340,8 @@ c['status'] = [html.Waterfall(http_port=0)]
 f = factory.BuildFactory([s(dummy.RemoteDummy, timeout=1)])
 
 c['builders'] = [
-    {'name': 'b1', 'slavenames': ['bot1','bot2'],
-     'builddir': 'b1', 'factory': f},
-    ]
+    BuilderConfig(name='b1', slavenames=['bot1', 'bot2'], factory=f),
+]
 c['buildbotURL'] = 'http://dummy.example.org:8010/'
 
 """
@@ -407,7 +417,7 @@ class GetURL(RunMixin, unittest.TestCase):
         self.assertURLEqual(step, "builders/b1/builds/0/steps/remote%20dummy")
         # maybe page for build.getTestResults?
         self.assertURLEqual(step.getLogs()[0],
-                            "builders/b1/builds/0/steps/remote%20dummy/logs/0")
+                            "builders/b1/builds/0/steps/remote%20dummy/logs/stdio")
 
 
 
@@ -417,15 +427,18 @@ class Logfile(BaseWeb, RunMixin, unittest.TestCase):
 from buildbot.status import html
 from buildbot.process.factory import BasicBuildFactory
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
+
 f1 = BasicBuildFactory('cvsroot', 'cvsmodule')
-BuildmasterConfig = {
+BuildmasterConfig = c = {
     'slaves': [BuildSlave('bot1', 'passwd1')],
     'schedulers': [],
-    'builders': [{'name': 'builder1', 'slavename': 'bot1',
-                  'builddir':'workdir', 'factory':f1}],
     'slavePortnum': 0,
     'status': [html.WebStatus(http_port=0)],
     }
+c['builders'] = [
+    BuilderConfig(name='builder1', slavename='bot1', factory=f1),
+]
 """
         if os.path.exists("test_logfile"):
             shutil.rmtree("test_logfile")
@@ -450,7 +463,7 @@ BuildmasterConfig = {
         bss.stepStarted()
 
         log1 = step1.addLog("output")
-        log1.addStdout("some stdout\n")
+        log1.addStdout(u"sÒme stdout\n")
         log1.finish()
 
         log2 = step1.addHTMLLog("error", "<html>ouch</html>")
@@ -504,7 +517,8 @@ BuildmasterConfig = {
         logurl = self.getLogURL("setup", "output")
         d = client.getPage(logurl + "/text")
         def _check(logtext):
-            self.failUnlessEqual(logtext, "some stdout\n")
+            # verify utf-8 encoding.
+            self.failUnlessEqual(logtext, "sÒme stdout\n")
         d.addCallback(_check)
         return d
 
@@ -601,3 +615,13 @@ BuildmasterConfig = {
         d.addCallback(_check)
         d.addErrback(_fail)
         return d
+
+class XMLRPC(unittest.TestCase):
+    def test_init(self):
+        server = xmlrpc.XMLRPCServer()
+        self.assert_(server)
+
+    def test_render(self):
+        self.assertRaises(NameError,
+                          lambda:
+                              xmlrpc.XMLRPCServer().render(Request()))

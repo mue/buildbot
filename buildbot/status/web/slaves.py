@@ -1,37 +1,38 @@
 
 import time, urllib
-from twisted.python import log
 from twisted.web import html
 from twisted.web.util import Redirect
+from twisted.web.error import NoResource
 
-from buildbot.status.web.base import HtmlResource, abbreviate_age, OneLineMixin, path_to_slave
-from buildbot import version, util
+from buildbot.status.web.base import HtmlResource, abbreviate_age, \
+    BuildLineMixin, path_to_slave
+from buildbot import util
 
 # /buildslaves/$slavename
-class OneBuildSlaveResource(HtmlResource, OneLineMixin):
+class OneBuildSlaveResource(HtmlResource, BuildLineMixin):
     addSlash = False
     def __init__(self, slavename):
         HtmlResource.__init__(self)
         self.slavename = slavename
 
     def getTitle(self, req):
-        return "Buildbot: %s" % html.escape(self.slavename)
+        return "Buildbot: %s" % self.slavename
 
     def getChild(self, path, req):
-        if path == "shutdown":
-            s = self.getStatus(req)
-            slave = s.getSlave(self.slavename)
+        s = self.getStatus(req)
+        slave = s.getSlave(self.slavename)
+        if path == "shutdown" and self.getControl(req):
             slave.setGraceful(True)
         return Redirect(path_to_slave(req, slave))
 
-    def body(self, req):
-        s = self.getStatus(req)
+    def content(self, request, ctx):        
+        s = self.getStatus(request)
         slave = s.getSlave(self.slavename)
+        
         my_builders = []
         for bname in s.getBuilderNames():
             b = s.getBuilder(bname)
             for bs in b.getSlaves():
-                slavename = bs.getName()
                 if bs.getName() == self.slavename:
                     my_builders.append(b)
 
@@ -39,89 +40,43 @@ class OneBuildSlaveResource(HtmlResource, OneLineMixin):
         current_builds = []
         for b in my_builders:
             for cb in b.getCurrentBuilds():
-                if cb.getSlavename() == self.slavename:
-                    current_builds.append(cb)
+                if cb.getSlavename() == self.slavename:                    
+                    current_builds.append(self.get_line_values(request, cb))
 
-        data = []
-
-        projectName = s.getProjectName()
-
-        data.append("<a href=\"%s\">%s</a>\n" % (self.path_to_root(req), projectName))
-
-        data.append("<h1>Build Slave: %s</h1>\n" % self.slavename)
-
-        shutdown_url = req.childLink("shutdown")
-
-        if not slave.isConnected():
-            data.append("<h2>NOT CONNECTED</h2>\n")
-        elif not slave.getGraceful():
-            data.append('''<form method="POST" action="%s">
-<input type="submit" value="Gracefully Shutdown">
-</form>''' % shutdown_url)
-        else:
-            data.append("Gracefully shutting down...\n")
-
-        if current_builds:
-            data.append("<h2>Currently building:</h2>\n")
-            data.append("<ul>\n")
-            for build in current_builds:
-                data.append("<li>%s</li>\n" % self.make_line(req, build, True))
-            data.append("</ul>\n")
-
-        else:
-            data.append("<h2>no current builds</h2>\n")
-
-        # Recent builds
-        data.append("<h2>Recent builds:</h2>\n")
-        data.append("<ul>\n")
-        n = 0
         try:
-            max_builds = int(req.args.get('builds')[0])
+            max_builds = int(request.args.get('numbuilds')[0])
         except:
             max_builds = 10
-        for build in s.generateFinishedBuilds(builders=[b.getName() for b in my_builders]):
-            if build.getSlavename() == self.slavename:
+           
+        recent_builds = []    
+        n = 0
+        for rb in s.generateFinishedBuilds(builders=[b.getName() for b in my_builders]):
+            if rb.getSlavename() == self.slavename:
                 n += 1
-                data.append("<li>%s</li>\n" % self.make_line(req, build, True))
+                recent_builds.append(self.get_line_values(request, rb))
                 if n > max_builds:
                     break
-        data.append("</ul>\n")
-
-        projectURL = s.getProjectURL()
-        projectName = s.getProjectName()
-        data.append('<hr /><div class="footer">\n')
-
-        welcomeurl = self.path_to_root(req) + "index.html"
-        data.append("[<a href=\"%s\">welcome</a>]\n" % welcomeurl)
-        data.append("<br />\n")
-
-        data.append('<a href="http://buildbot.sourceforge.net/">Buildbot</a>')
-        data.append("-%s " % version)
-        if projectName:
-            data.append("working for the ")
-            if projectURL:
-                data.append("<a href=\"%s\">%s</a> project." % (projectURL,
-                                                            projectName))
-            else:
-                data.append("%s project." % projectName)
-        data.append("<br />\n")
-        data.append("Page built: " +
-                 time.strftime("%a %d %b %Y %H:%M:%S",
-                               time.localtime(util.now()))
-                 + "\n")
-        data.append("</div>\n")
-
-        return "".join(data)
+        ctx.update(dict(slave = s.getSlave(self.slavename),
+                        slavename = self.slavename,  
+                        current = current_builds, 
+                        recent = recent_builds, 
+                        shutdown_url = request.childLink("shutdown"),
+                        control = self.getControl(request),
+                        this_url = "../../../" + path_to_slave(request, slave),
+                        access_uri = slave.getAccessURI()),
+                        admin = unicode(slave.getAdmin() or '', 'utf-8'),
+                        host = unicode(slave.getHost() or '', 'utf-8'))
+        template = request.site.buildbot_service.templates.get_template("buildslave.html")
+        data = template.render(**ctx)
+        return data
 
 # /buildslaves
 class BuildSlavesResource(HtmlResource):
     title = "BuildSlaves"
     addSlash = True
 
-    def body(self, req):
-        s = self.getStatus(req)
-        data = ""
-        data += "<h1>Build Slaves</h1>\n"
+    def content(self, request, ctx):
+        s = self.getStatus(request)
 
         used_by_builder = {}
         for bname in s.getBuilderNames():
@@ -131,51 +86,39 @@ class BuildSlavesResource(HtmlResource):
                 if slavename not in used_by_builder:
                     used_by_builder[slavename] = []
                 used_by_builder[slavename].append(bname)
-
-        data += "<ol>\n"
+                
+        slaves = ctx['slaves'] = []
         for name in util.naturalSort(s.getSlaveNames()):
+            info = {}
+            slaves.append(info)
             slave = s.getSlave(name)
             slave_status = s.botmaster.slaves[name].slave_status
-            isBusy = len(slave_status.getRunningBuilds())
-            data += " <li><a href=\"%s\">%s</a>:\n" % (req.childLink(urllib.quote(name,'')), name)
-            data += " <ul>\n"
-            builder_links = ['<a href="%s">%s</a>'
-                             % (req.childLink("../builders/%s" % bname),bname)
-                             for bname in used_by_builder.get(name, [])]
-            if builder_links:
-                data += ("  <li>Used by Builders: %s</li>\n" %
-                         ", ".join(builder_links))
-            else:
-                data += "  <li>Not used by any Builders</li>\n"
+            info['running_builds'] = len(slave_status.getRunningBuilds())
+            info['link'] = request.childLink(urllib.quote(name,''))
+            info['name'] = name
+            
+            info['builders'] = []
+            for b in used_by_builder.get(name, []):
+                info['builders'].append(dict(link=request.childLink("../builders/%s" % b), name=b))
+                                        
+            info['version'] = slave.getVersion()
+            info['connected'] = slave.isConnected()
+            
             if slave.isConnected():
-                data += "  <li>Slave is currently connected</li>\n"
-                admin = slave.getAdmin()
-                if admin:
-                    # munge it to avoid feeding the spambot harvesters
-                    admin = admin.replace("@", " -at- ")
-                    data += "  <li>Admin: %s</li>\n" % admin
+                info['admin'] = unicode(slave.getAdmin(), 'utf-8')
                 last = slave.lastMessageReceived()
                 if last:
-                    lt = time.strftime("%Y-%b-%d %H:%M:%S",
-                                       time.localtime(last))
-                    age = abbreviate_age(time.time() - last)
-                    data += "  <li>Last heard from: %s " % age
-                    data += '<font size="-1">(%s)</font>' % lt
-                    data += "</li>\n"
-                    if isBusy:
-                        data += "<li>Slave is currently building.</li>"
-                    else:
-                        data += "<li>Slave is idle.</li>"
-            else:
-                data += "  <li><b>Slave is NOT currently connected</b></li>\n"
+                    info['last_heard_from_age'] = abbreviate_age(time.time() - last)
+                    info['last_heard_from_time'] = time.strftime("%Y-%b-%d %H:%M:%S",
+                                                                time.localtime(last))
 
-            data += " </ul>\n"
-            data += " </li>\n"
-            data += "\n"
-
-        data += "</ol>\n"
-
+        template = request.site.buildbot_service.templates.get_template("buildslaves.html")
+        data = template.render(**ctx)
         return data
 
     def getChild(self, path, req):
-        return OneBuildSlaveResource(path)
+        try:
+            slave = self.getStatus(req).getSlave(path)
+            return OneBuildSlaveResource(path)
+        except KeyError:
+            return NoResource("No such slave '%s'" % html.escape(path))

@@ -2,6 +2,7 @@
 import random, weakref
 from zope.interface import implements
 from twisted.python import log, components
+from twisted.python.failure import Failure
 from twisted.spread import pb
 from twisted.internet import reactor, defer
 
@@ -9,13 +10,15 @@ from buildbot import interfaces
 from buildbot.status.progress import Expectations
 from buildbot.util import now
 from buildbot.process import base
+from buildbot.process.properties import Properties
 
 (ATTACHING, # slave attached, still checking hostinfo/etc
  IDLE, # idle, available for use
  PINGING, # build about to start, making sure it is still alive
  BUILDING, # build is running
  LATENT, # latent slave is not substantiated; similar to idle
- ) = range(5)
+ SUBSTANTIATING,
+ ) = range(6)
 
 
 class AbstractSlaveBuilder(pb.Referenceable):
@@ -114,7 +117,10 @@ class AbstractSlaveBuilder(pb.Referenceable):
         log.err(why)
         return why
 
-    def ping(self, timeout, status=None):
+    def prepare(self, builder_status):
+        return defer.succeed(None)
+
+    def ping(self, status=None):
         """Ping the slave to make sure it is still there. Returns a Deferred
         that fires with True if it is.
 
@@ -134,7 +140,7 @@ class AbstractSlaveBuilder(pb.Referenceable):
                 self.ping_watchers.insert(0, d2)
                 # I think it will make the tests run smoother if the status
                 # is updated before the ping completes
-            Ping().ping(self.remote, timeout).addCallback(self._pong)
+            Ping().ping(self.remote).addCallback(self._pong)
 
         def reset_state(res):
             if self.state == PINGING:
@@ -167,9 +173,8 @@ class AbstractSlaveBuilder(pb.Referenceable):
 
 class Ping:
     running = False
-    timer = None
 
-    def ping(self, remote, timeout):
+    def ping(self, remote):
         assert not self.running
         self.running = True
         log.msg("sending ping")
@@ -179,40 +184,14 @@ class Ping:
         remote.callRemote("print", "ping").addCallbacks(self._pong,
                                                         self._ping_failed,
                                                         errbackArgs=(remote,))
-
-        # We use either our own timeout or the (long) TCP timeout to detect
-        # silently-missing slaves. This might happen because of a NAT
-        # timeout or a routing loop. If the slave just shuts down (and we
-        # somehow missed the FIN), we should get a "connection refused"
-        # message.
-        self.timer = reactor.callLater(timeout, self._ping_timeout, remote)
         return self.d
-
-    def _ping_timeout(self, remote):
-        log.msg("ping timeout")
-        # force the BuildSlave to disconnect, since this indicates that
-        # the bot is unreachable.
-        del self.timer
-        remote.broker.transport.loseConnection()
-        # the forcibly-lost connection will now cause the ping to fail
-
-    def _stopTimer(self):
-        if not self.running:
-            return
-        self.running = False
-
-        if self.timer:
-            self.timer.cancel()
-            del self.timer
 
     def _pong(self, res):
         log.msg("ping finished: success")
-        self._stopTimer()
         self.d.callback(True)
 
     def _ping_failed(self, res, remote):
         log.msg("ping finished: failure")
-        self._stopTimer()
         # the slave has some sort of internal error, disconnect them. If we
         # don't, we'll requeue a build and ping them again right away,
         # creating a nasty loop.
@@ -258,7 +237,20 @@ class LatentSlaveBuilder(AbstractSlaveBuilder):
         log.msg("Latent buildslave %s attached to %s" % (slave.slavename,
                                                          self.builder_name))
 
-    def substantiate(self, build):
+    def prepare(self, builder_status):
+        log.msg("substantiating slave %s" % (self,))
+        d = self.substantiate()
+        def substantiation_failed(f):
+            builder_status.addPointEvent(['removing', 'latent',
+                                          self.slave.slavename])
+            self.slave.disconnect()
+            # TODO: should failover to a new Build
+            return f
+        d.addErrback(substantiation_failed)
+        return d
+
+    def substantiate(self):
+        self.state = SUBSTANTIATING
         d = self.slave.substantiate(self)
         if not self.slave.substantiated:
             event = self.builder.builder_status.addEvent(
@@ -296,12 +288,12 @@ class LatentSlaveBuilder(AbstractSlaveBuilder):
         self.state = LATENT
         return AbstractSlaveBuilder._attachFailure(self, why, where)
 
-    def ping(self, timeout, status=None):
+    def ping(self, status=None):
         if not self.slave.substantiated:
             if status:
                 status.addEvent(["ping", "latent"]).finish()
             return defer.succeed(True)
-        return AbstractSlaveBuilder.ping(self, timeout, status)
+        return AbstractSlaveBuilder.ping(self, status)
 
 
 class Builder(pb.Referenceable):
@@ -332,11 +324,6 @@ class Builder(pb.Referenceable):
     I also manage forced builds, progress expectation (ETA) management, and
     some status delivery chores.
 
-    I am persisted in C{BASEDIR/BUILDERNAME/builder}, so I can remember how
-    long a build usually takes to run (in my C{expectations} attribute). This
-    pickle also includes the L{buildbot.status.builder.BuilderStatus} object,
-    which remembers the set of historic builds.
-
     @type buildable: list of L{buildbot.process.base.BuildRequest}
     @ivar buildable: BuildRequests that are ready to build, but which are
                      waiting for a buildslave to be available.
@@ -349,7 +336,6 @@ class Builder(pb.Referenceable):
     """
 
     expectations = None # this is created the first time we get a good build
-    START_BUILD_TIMEOUT = 10
     CHOOSE_SLAVES_RANDOMLY = True # disabled for determinism during tests
 
     def __init__(self, setup, builder_status):
@@ -357,7 +343,7 @@ class Builder(pb.Referenceable):
         @type  setup: dict
         @param setup: builder setup data, as stored in
                       BuildmasterConfig['builders'].  Contains name,
-                      slavename(s), builddir, factory, locks.
+                      slavename(s), builddir, slavebuilddir, factory, locks.
         @type  builder_status: L{buildbot.status.builder.BuilderStatus}
         """
         self.name = setup['name']
@@ -367,7 +353,11 @@ class Builder(pb.Referenceable):
         if setup.has_key('slavenames'):
             self.slavenames.extend(setup['slavenames'])
         self.builddir = setup['builddir']
+        self.slavebuilddir = setup['slavebuilddir']
         self.buildFactory = setup['factory']
+        self.nextSlave = setup.get('nextSlave')
+        if self.nextSlave is not None and not callable(self.nextSlave):
+            raise ValueError("nextSlave must be callable")
         self.locks = setup.get("locks", [])
         self.env = setup.get('env', {})
         assert isinstance(self.env, dict)
@@ -375,6 +365,9 @@ class Builder(pb.Referenceable):
             raise ValueError("periodicBuildTime can no longer be defined as"
                              " part of the Builder: use scheduler.Periodic"
                              " instead")
+        self.nextBuild = setup.get('nextBuild')
+        if self.nextBuild is not None and not callable(self.nextBuild):
+            raise ValueError("nextBuild must be callable")
 
         # build/wannabuild slots: Build objects move along this sequence
         self.buildable = []
@@ -413,14 +406,17 @@ class Builder(pb.Referenceable):
         if setup['builddir'] != self.builddir:
             diffs.append('builddir changed from %s to %s' \
                          % (self.builddir, setup['builddir']))
+        if setup['slavebuilddir'] != self.slavebuilddir:
+            diffs.append('slavebuilddir changed from %s to %s' \
+                         % (self.slavebuilddir, setup['slavebuilddir']))
         if setup['factory'] != self.buildFactory: # compare objects
             diffs.append('factory changed')
-        oldlocks = [(lock.__class__, lock.name)
-                    for lock in self.locks]
-        newlocks = [(lock.__class__, lock.name)
-                    for lock in setup.get('locks',[])]
-        if oldlocks != newlocks:
-            diffs.append('locks changed from %s to %s' % (oldlocks, newlocks))
+        if setup.get('locks', []) != self.locks:
+            diffs.append('locks changed from %s to %s' % (self.locks, setup.get('locks')))
+        if setup.get('nextSlave') != self.nextSlave:
+            diffs.append('nextSlave changed from %s to %s' % (self.nextSlave, setup['nextSlave']))
+        if setup.get('nextBuild') != self.nextBuild:
+            diffs.append('nextBuild changed from %s to %s' % (self.nextBuild, setup['nextBuild']))
         return diffs
 
     def __repr__(self):
@@ -440,26 +436,14 @@ class Builder(pb.Referenceable):
         self.buildable.append(req)
         req.requestSubmitted(self)
         self.builder_status.addBuildRequest(req.status)
-        self.maybeStartBuild()
+        self.botmaster.maybeStartAllBuilds()
 
     def cancelBuildRequest(self, req):
         if req in self.buildable:
             self.buildable.remove(req)
-            self.builder_status.removeBuildRequest(req.status)
+            self.builder_status.removeBuildRequest(req.status, cancelled=True)
             return True
         return False
-
-    def __getstate__(self):
-        d = self.__dict__.copy()
-        # TODO: note that d['buildable'] can contain Deferreds
-        del d['building'] # TODO: move these back to .buildable?
-        del d['slaves']
-        return d
-
-    def __setstate__(self, d):
-        self.__dict__ = d
-        self.building = []
-        self.slaves = []
 
     def consumeTheSoulOfYourPredecessor(self, old):
         """Suck the brain out of an old Builder.
@@ -554,7 +538,7 @@ class Builder(pb.Referenceable):
             self.builder_status.addPointEvent(
                 ['added', 'latent', slave.slavename])
             self.slaves.append(sb)
-            reactor.callLater(0, self.maybeStartBuild)
+            reactor.callLater(0, self.botmaster.maybeStartAllBuilds)
 
     def attached(self, slave, remote, commands):
         """This is invoked by the BuildSlave when the self.slavename bot
@@ -620,7 +604,6 @@ class Builder(pb.Referenceable):
 
     def detached(self, slave):
         """This is called when the connection to the bot is lost."""
-        log.msg("%s.detached" % self, slave.slavename)
         for sb in self.attaching_slaves + self.slaves:
             if sb.slave == slave:
                 break
@@ -663,8 +646,8 @@ class Builder(pb.Referenceable):
             self.fireTestEvent('idle')
 
     def maybeStartBuild(self):
-        log.msg("maybeStartBuild %s: %s %s" %
-                (self, self.buildable, self.slaves))
+        log.msg("maybeStartBuild %s: %i request(s), %i slave(s)" %
+                (self, len(self.buildable), len(self.slaves)))
         if not self.buildable:
             self.updateBigStatus()
             return # nothing to do
@@ -672,12 +655,20 @@ class Builder(pb.Referenceable):
         # pick an idle slave
         available_slaves = [sb for sb in self.slaves if sb.isAvailable()]
         if not available_slaves:
-            log.msg("%s: want to start build, but we don't have a remote"
-                    % self)
             self.updateBigStatus()
             return
-        if self.CHOOSE_SLAVES_RANDOMLY:
-            # TODO prefer idle over latent? maybe other sorting preferences?
+        if self.nextSlave:
+            sb = None
+            try:
+                sb = self.nextSlave(self, available_slaves)
+            except:
+                log.msg("Exception choosing next slave")
+                log.err(Failure())
+
+            if not sb:
+                self.updateBigStatus()
+                return
+        elif self.CHOOSE_SLAVES_RANDOMLY:
             sb = random.choice(available_slaves)
         else:
             sb = available_slaves[0]
@@ -685,7 +676,21 @@ class Builder(pb.Referenceable):
         # there is something to build, and there is a slave on which to build
         # it. Grab the oldest request, see if we can merge it with anything
         # else.
-        req = self.buildable.pop(0)
+        if not self.nextBuild:
+            req = self.buildable.pop(0)
+        else:
+            try:
+                req = self.nextBuild(self, self.buildable)
+                if not req:
+                    # Nothing to do
+                    self.updateBigStatus()
+                    return
+                self.buildable.remove(req)
+            except:
+                log.msg("Exception choosing next build")
+                log.err(Failure())
+                self.updateBigStatus()
+                return
         self.builder_status.removeBuildRequest(req.status)
         mergers = []
         botmaster = self.botmaster
@@ -719,27 +724,20 @@ class Builder(pb.Referenceable):
 
         self.building.append(build)
         self.updateBigStatus()
-        if isinstance(sb, LatentSlaveBuilder):
-            log.msg("starting build %s.. substantiating the slave %s" %
-                    (build, sb))
-            d = sb.substantiate(build)
-            def substantiated(res):
-                return sb.ping(self.START_BUILD_TIMEOUT)
-            def substantiation_failed(res):
-                self.builder_status.addPointEvent(
-                    ['removing', 'latent', sb.slave.slavename])
-                sb.slave.disconnect()
-                # TODO: should failover to a new Build
-                #self.retryBuild(sb.build)
-            d.addCallbacks(substantiated, substantiation_failed)
-        else:
+        log.msg("starting build %s using slave %s" % (build, sb))
+        d = sb.prepare(self.builder_status)
+        def _ping(ign):
+            # ping the slave to make sure they're still there. If they've
+            # fallen off the map (due to a NAT timeout or something), this
+            # will fail in a couple of minutes, depending upon the TCP
+            # timeout.
+            #
+            # TODO: This can unnecessarily suspend the starting of a build, in
+            # situations where the slave is live but is pushing lots of data to
+            # us in a build.
             log.msg("starting build %s.. pinging the slave %s" % (build, sb))
-            d = sb.ping(self.START_BUILD_TIMEOUT)
-        # ping the slave to make sure they're still there. If they're fallen
-        # off the map (due to a NAT timeout or something), this will fail in
-        # a couple of minutes, depending upon the TCP timeout. TODO: consider
-        # making this time out faster, or at least characterize the likely
-        # duration.
+            return sb.ping()
+        d.addCallback(_ping)
         d.addCallback(self._startBuild_1, build, sb)
         return d
 
@@ -766,7 +764,7 @@ class Builder(pb.Referenceable):
         d = build.startBuild(bs, self.expectations, sb)
         d.addCallback(self.buildFinished, sb)
         d.addErrback(log.err) # this shouldn't happen. if it does, the slave
-                              # will be wedged
+                                # will be wedged
         for req in build.requests:
             req.buildStarted(build, bs)
         return build # this is the IBuildControl
@@ -784,7 +782,7 @@ class Builder(pb.Referenceable):
         self.building.remove(build)
         for req in build.requests:
             self.buildable.insert(0, req) # the interrupted build gets first
-                                          # priority
+                                            # priority
             self.builder_status.addBuildRequest(req.status)
 
 
@@ -838,28 +836,40 @@ class BuilderControl(components.Adapter):
             raise interfaces.NoSlaveError
         self.requestBuild(req)
 
-    def resubmitBuild(self, bs, reason="<rebuild, no reason given>"):
+    def resubmitBuild(self, bs, reason="<rebuild, no reason given>", extraProperties=None):
         if not bs.isFinished():
             return
 
         ss = bs.getSourceStamp(absolute=True)
-        req = base.BuildRequest(reason, ss, self.original.name)
+        if extraProperties is None:
+            properties = bs.getProperties()
+        else:
+            # Make a copy so as not to modify the original build.
+            properties = Properties()
+            properties.updateFromProperties(bs.getProperties())
+            properties.updateFromProperties(extraProperties)
+        req = base.BuildRequest(reason, ss, self.original.name,
+                                properties=properties)
         self.requestBuild(req)
 
     def getPendingBuilds(self):
         # return IBuildRequestControl objects
-        raise NotImplementedError
+        retval = []
+        for r in self.original.buildable:
+            retval.append(BuildRequestControl(self.original, r))
+
+        return retval
 
     def getBuild(self, number):
         return self.original.getBuild(number)
 
-    def ping(self, timeout=30):
+    def ping(self):
         if not self.original.slaves:
             self.original.builder_status.addPointEvent(["ping", "no slave"])
             return defer.succeed(False) # interfaces.NoSlaveError
         dl = []
         for s in self.original.slaves:
-            dl.append(s.ping(timeout, self.original.builder_status))
+            dl.append(s.ping(self.original.builder_status))
         d = defer.DeferredList(dl)
         d.addCallback(self._gatherPingResults)
         return d
@@ -871,3 +881,19 @@ class BuilderControl(components.Adapter):
         return True
 
 components.registerAdapter(BuilderControl, Builder, interfaces.IBuilderControl)
+
+class BuildRequestControl:
+    implements(interfaces.IBuildRequestControl)
+
+    def __init__(self, builder, request):
+        self.original_builder = builder
+        self.original_request = request
+
+    def subscribe(self, observer):
+        raise NotImplementedError
+
+    def unsubscribe(self, observer):
+        raise NotImplementedError
+
+    def cancel(self):
+        self.original_builder.cancelBuildRequest(self.original_request)

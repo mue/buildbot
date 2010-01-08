@@ -1,10 +1,13 @@
 
-import urlparse, urllib, time
+import urlparse, urllib, time, re
 from zope.interface import Interface
-from twisted.web import html, resource
+from twisted.web import resource, static
+from twisted.python import log
 from buildbot.status import builder
 from buildbot.status.builder import SUCCESS, WARNINGS, FAILURE, SKIPPED, EXCEPTION
 from buildbot import version, util
+import os, cgi
+from buildbot.process.properties import Properties
 
 class ITopBox(Interface):
     """I represent a box in the top row of the waterfall display: the one
@@ -34,102 +37,28 @@ css_classes = {SUCCESS: "success",
                FAILURE: "failure",
                SKIPPED: "skipped",
                EXCEPTION: "exception",
+               None: "",
                }
 
-ROW_TEMPLATE = '''
-<div class="row">
-  <span class="label">%(label)s</span>
-  <span class="field">%(field)s</span>
-</div>
-'''
 
-def make_row(label, field):
-    """Create a name/value row for the HTML.
-
-    `label` is plain text; it will be HTML-encoded.
-
-    `field` is a bit of HTML structure; it will not be encoded in
-    any way.
+def getAndCheckProperties(req):
     """
-    label = html.escape(label)
-    return ROW_TEMPLATE % {"label": label, "field": field}
-
-def make_name_user_passwd_form(useUserPasswd):
-    """helper function to create HTML prompt for 'name' when
-    C{useUserPasswd} is C{False} or 'username' / 'password' prompt
-    when C{True}."""
-
-    if useUserPasswd:
-	label = "Your username:"
-    else:
-        label = "Your name:"
-    data = make_row(label, '<input type="text" name="username" />')
-    if useUserPasswd:
-	data += make_row("Your password:",
-			 '<input type="password" name="passwd" />')
-    return data
-
-def make_stop_form(stopURL, useUserPasswd, on_all=False, label="Build"):
-    if on_all:
-        data = """<form action="%s" class='command stopbuild'>
-          <p>To stop all builds, fill out the following fields and
-          push the 'Stop' button</p>\n""" % stopURL
-    else:
-        data = """<form action="%s" class='command stopbuild'>
-          <p>To stop this build, fill out the following fields and
-          push the 'Stop' button</p>\n""" % stopURL
-    data += make_name_user_passwd_form(useUserPasswd)
-    data += make_row("Reason for stopping build:",
-                     "<input type='text' name='comments' />")
-    data += '<input type="submit" value="Stop %s" /></form>\n' % label
-    return data
-
-def make_force_build_form(forceURL, useUserPasswd, on_all=False):
-    if on_all:
-        data = """<form action="%s" class="command forcebuild">
-          <p>To force a build on all Builders, fill out the following fields
-          and push the 'Force Build' button</p>""" % forceURL
-    else:
-        data = """<form action="%s" class="command forcebuild">
-          <p>To force a build, fill out the following fields and
-          push the 'Force Build' button</p>""" % forceURL
-    return (data
-      + make_name_user_passwd_form(useUserPasswd)
-      + make_row("Reason for build:",
-                 "<input type='text' name='comments' />")
-      + make_row("Branch to build:",
-                 "<input type='text' name='branch' />")
-      + make_row("Revision to build:",
-                 "<input type='text' name='revision' />")
-      + '<input type="submit" value="Force Build" /></form>\n')
-
-def td(text="", parms={}, **props):
-    data = ""
-    data += "  "
-    #if not props.has_key("border"):
-    #    props["border"] = 1
-    props.update(parms)
-    comment = props.get("comment", None)
-    if comment:
-        data += "<!-- %s -->" % comment
-    data += "<td"
-    class_ = props.get('class_', None)
-    if class_:
-        props["class"] = class_
-    for prop in ("align", "colspan", "rowspan", "border",
-                 "valign", "halign", "class"):
-        p = props.get(prop, None)
-        if p != None:
-            data += " %s=\"%s\"" % (prop, p)
-    data += ">"
-    if not text:
-        text = "&nbsp;"
-    if isinstance(text, list):
-        data += "<br />".join(text)
-    else:
-        data += text
-    data += "</td>\n"
-    return data
+Fetch custom build properties from the HTTP request of a "Force build" or
+"Resubmit build" HTML form.
+Check the names for valid strings, and return None if a problem is found.
+Return a new Properties object containing each property found in req.
+"""
+    properties = Properties()
+    for i in (1,2,3):
+        pname = req.args.get("property%dname" % i, [""])[0]
+        pvalue = req.args.get("property%dvalue" % i, [""])[0]
+        if pname and pvalue:
+            if not re.match(r'^[\w\.\-\/\~:]*$', pname) \
+                    or not re.match(r'^[\w\.\-\/\~:]*$', pvalue):
+                log.msg("bad property name='%s', value='%s'" % (pname, pvalue))
+                return None
+            properties.setProperty(pname, pvalue, "Force Build Form")
+    return properties
 
 def build_get_class(b):
     """
@@ -184,6 +113,10 @@ def path_to_slave(request, slave):
             "buildslaves/" +
             urllib.quote(slave.getName(), safe=''))
 
+def path_to_change(request, change):
+    return (path_to_root(request) +
+            "changes/%s" % change.number)
+
 class Box:
     # a Box wraps an Event. The Box has HTML <td> parameters that Events
     # lack, and it has a base URL to which each File's name is relative.
@@ -208,8 +141,9 @@ class Box:
         text = self.text
         if not text and self.show_idle:
             text = ["[idle]"]
-        return td(text, props, class_=self.class_)
-
+        props['class'] = self.class_
+        props['text'] = text;
+        return props    
 
 class HtmlResource(resource.Resource):
     # this is a cheap sort of template thingy
@@ -256,7 +190,9 @@ class HtmlResource(resource.Resource):
             request.redirect(new_url)
             return ''
 
-        data = self.content(request)
+        ctx = self.getContext(request)
+
+        data = self.content(request, ctx)
         if isinstance(data, unicode):
             data = data.encode("utf-8")
         request.setHeader("content-type", self.contentType)
@@ -265,6 +201,22 @@ class HtmlResource(resource.Resource):
             return ''
         return data
 
+    def getContext(self, request):
+        status = self.getStatus(request)
+        path_to_root = self.path_to_root(request)
+        return dict(project_url = status.getProjectURL(),
+                    project_name = status.getProjectName(),
+                    stylesheet = path_to_root + 'default.css',
+                    path_to_root = path_to_root,
+                    version = version,
+                    time = time.strftime("%a %d %b %Y %H:%M:%S",
+                                        time.localtime(util.now())),
+                    tz = time.tzname[time.localtime()[-1]],
+                    metatags = [],
+                    title = self.getTitle(request),
+                    welcomeurl = path_to_root)
+        
+
     def getStatus(self, request):
         return request.site.buildbot_service.getStatus()
 
@@ -272,13 +224,13 @@ class HtmlResource(resource.Resource):
         return request.site.buildbot_service.getControl()
 
     def isUsingUserPasswd(self, request):
-	return request.site.buildbot_service.isUsingUserPasswd()
+        return request.site.buildbot_service.isUsingUserPasswd()
 
     def authUser(self, request):
-	user = request.args.get("username", ["<unknown>"])[0]
-	passwd = request.args.get("passwd", ["<no-password>"])[0]
-	if user == "<unknown>" or passwd == "<no-password>":
-	    return False
+        user = request.args.get("username", ["<unknown>"])[0]
+        passwd = request.args.get("passwd", ["<no-password>"])[0]
+        if user == "<unknown>" or passwd == "<no-password>":
+            return False
         return request.site.buildbot_service.authUser(user, passwd)
 
     def getChangemaster(self, request):
@@ -287,76 +239,67 @@ class HtmlResource(resource.Resource):
     def path_to_root(self, request):
         return path_to_root(request)
 
-    def footer(self, s, req):
-        # TODO: this stuff should be generated by a template of some sort
-        projectURL = s.getProjectURL()
-        projectName = s.getProjectName()
-        data = '<hr /><div class="footer">\n'
-
-        welcomeurl = self.path_to_root(req) + "index.html"
-        data += '[<a href="%s">welcome</a>]\n' % welcomeurl
-        data += "<br />\n"
-
-        data += '<a href="http://buildbot.sourceforge.net/">Buildbot</a>'
-        data += "-%s " % version
-        if projectName:
-            data += "working for the "
-            if projectURL:
-                data += "<a href=\"%s\">%s</a> project." % (projectURL,
-                                                            projectName)
-            else:
-                data += "%s project." % projectName
-        data += "<br />\n"
-        data += ("Page built: " +
-                 time.strftime("%a %d %b %Y %H:%M:%S",
-                               time.localtime(util.now()))
-                 + "\n")
-        data += '</div>\n'
-
-        return data
-
     def getTitle(self, request):
         return self.title
-
-    def fillTemplate(self, template, request):
-        s = request.site.buildbot_service
-        values = s.template_values.copy()
-        values['root'] = self.path_to_root(request)
-        # e.g. to reference the top-level 'buildbot.css' page, use
-        # "%(root)sbuildbot.css"
-        values['title'] = self.getTitle(request)
-        return template % values
-
-    def content(self, request):
-        s = request.site.buildbot_service
-        data = ""
-        data += self.fillTemplate(s.header, request)
-        data += "<head>\n"
-        for he in s.head_elements:
-            data += " " + self.fillTemplate(he, request) + "\n"
-            data += self.head(request)
-        data += "</head>\n\n"
-
-        data += '<body %s>\n' % " ".join(['%s="%s"' % (k,v)
-                                          for (k,v) in s.body_attrs.items()])
-        data += self.body(request)
-        data += "</body>\n"
-        data += self.fillTemplate(s.footer, request)
-        return data
-
-    def head(self, request):
-        return ""
-
-    def body(self, request):
-        return "Dummy\n"
 
 class StaticHTML(HtmlResource):
     def __init__(self, body, title):
         HtmlResource.__init__(self)
         self.bodyHTML = body
         self.title = title
-    def body(self, request):
-        return self.bodyHTML
+    def content(self, request, cxt):
+        cxt['content'] = self.bodyHTML
+        cxt['title'] = self.title
+        template = request.site.buildbot_service.templates.get_template("empty.html")
+        return template.render(**cxt)
+
+class DirectoryLister(static.DirectoryLister):
+    """This variant of the static.DirectoryLister uses a template
+    for rendering."""
+
+    def render(self, request):
+
+        status = request.site.buildbot_service.getStatus()
+
+        cxt = dict(project_url = status.getProjectURL(),
+                   project_name = status.getProjectName(),
+                   stylesheet = path_to_root(request) + 'default.css',
+                   version = version,
+                   time = time.strftime("%a %d %b %Y %H:%M:%S",
+                                        time.localtime(util.now())),
+                   tz = time.tzname[time.localtime()[-1]],
+                   metatags = [],
+                   title = 'BuildBot')
+
+        if self.dirs is None:
+            directory = os.listdir(self.path)
+            directory.sort()
+        else:
+            directory = self.dirs
+
+        dirs, files = self._getFilesAndDirectories(directory)
+
+        cxt['path'] = cgi.escape(urllib.unquote(request.uri))
+        cxt['directories'] = dirs
+        cxt['files'] = files
+        template = request.site.buildbot_service.templates.get_template("directory.html")
+        data = template.render(**cxt)
+        if isinstance(data, unicode):
+            data = data.encode("utf-8")
+        return data
+        
+
+class StaticFile(static.File):
+    """This class adds support for templated directory
+    views."""
+
+    def directoryListing(self):
+        return DirectoryLister(self.path,
+                               self.listNames(),
+                               self.contentTypes,
+                               self.contentEncodings,
+                               self.defaultType)
+        
 
 MINUTE = 60
 HOUR = 60*MINUTE
@@ -365,6 +308,7 @@ WEEK = 7*DAY
 MONTH = 30*DAY
 
 def plural(word, words, num):
+
     if int(num) == 1:
         return "%d %s" % (num, word)
     else:
@@ -384,10 +328,10 @@ def abbreviate_age(age):
     return "a long time ago"
 
 
-class OneLineMixin:
+class BuildLineMixin:
     LINE_TIME_FORMAT = "%b %d %H:%M"
 
-    def get_line_values(self, req, build):
+    def get_line_values(self, req, build, include_builder=True):
         '''
         Collect the data needed for each line display
         '''
@@ -402,9 +346,12 @@ class OneLineMixin:
             rev = "??"
         rev = str(rev)
         if len(rev) > 40:
-            rev = "version is too-long"
-        root = self.path_to_root(req)
+            rev = rev[0:40] + "..."
         css_class = css_classes.get(results, "")
+
+        if type(text) == list:
+            text = " ".join(text)            
+
         values = {'class': css_class,
                   'builder_name': builder_name,
                   'buildnum': build.getNumber(),
@@ -415,24 +362,10 @@ class OneLineMixin:
                   'rev': rev,
                   'time': time.strftime(self.LINE_TIME_FORMAT,
                                         time.localtime(build.getTimes()[0])),
+                  'text': text,
+                  'include_builder': include_builder
                   }
         return values
-
-    def make_line(self, req, build, include_builder=True):
-        '''
-        Format and render a single line into HTML
-        '''
-        values = self.get_line_values(req, build)
-        fmt_pieces = ['<font size="-1">(%(time)s)</font>',
-                      'rev=[%(rev)s]',
-                      '<span class="%(class)s">%(results)s</span>',
-                      ]
-        if include_builder:
-            fmt_pieces.append('<a href="%(builderurl)s">%(builder_name)s</a>')
-        fmt_pieces.append('<a href="%(buildurl)s">#%(buildnum)d</a>:')
-        fmt_pieces.append('%(text)s')
-        data = " ".join(fmt_pieces) % values
-        return data
 
 def map_branches(branches):
     # when the query args say "trunk", present that to things like

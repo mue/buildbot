@@ -12,7 +12,16 @@ import os, shutil, sys, re, urllib, itertools
 import gc
 from cPickle import load, dump
 from cStringIO import StringIO
-from bz2 import BZ2File
+
+try: # bz2 is not available on py23
+    from bz2 import BZ2File
+except ImportError:
+    BZ2File = None
+
+try:
+    from gzip import GzipFile
+except ImportError:
+    GzipFile = None
 
 # sibling imports
 from buildbot import interfaces, util, sourcestamp
@@ -220,13 +229,21 @@ class LogFile:
 
     finished = False
     length = 0
+    nonHeaderLength = 0
+    tailLength = 0
     chunkSize = 10*1000
     runLength = 0
+    # No max size by default
+    logMaxSize = None
+    # Don't keep a tail buffer by default
+    logMaxTailSize = None
+    maxLengthExceeded = False
     runEntries = [] # provided so old pickled builds will getChunks() ok
     entries = None
     BUFFERSIZE = 2048
     filename = None # relative to the Builder's basedir
     openfile = None
+    compressMethod = "bz2"
 
     def __init__(self, parent, name, logfilename):
         """
@@ -247,16 +264,21 @@ class LogFile:
             # is out of date, and we're overlapping with earlier builds now.
             # Warn about it, but then overwrite the old pickle file
             log.msg("Warning: Overwriting old serialized Build at %s" % fn)
+        dirname = os.path.dirname(fn)
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
         self.openfile = open(fn, "w+")
         self.runEntries = []
         self.watchers = []
         self.finishedWatchers = []
+        self.tailBuffer = []
 
     def getFilename(self):
         return os.path.join(self.step.build.builder.basedir, self.filename)
 
     def hasContents(self):
         return os.path.exists(self.getFilename() + '.bz2') or \
+            os.path.exists(self.getFilename() + '.gz') or \
             os.path.exists(self.getFilename())
 
     def getName(self):
@@ -282,10 +304,16 @@ class LogFile:
             return self.openfile
         # otherwise they get their own read-only handle
         # try a compressed log first
-        try:
-            return BZ2File(self.getFilename() + ".bz2", "r")
-        except IOError:
-            pass
+        if BZ2File is not None:
+            try:
+                return BZ2File(self.getFilename() + ".bz2", "r")
+            except IOError:
+                pass
+        if GzipFile is not None:
+            try:
+                return GzipFile(self.getFilename() + ".gz", "r")
+            except IOError:
+                pass
         return open(self.getFilename(), "r")
 
     def getText(self):
@@ -309,9 +337,13 @@ class LogFile:
         # yield() calls.
 
         f = self.getFile()
-        offset = 0
-        f.seek(0, 2)
-        remaining = f.tell()
+        if not self.finished:
+            offset = 0
+            f.seek(0, 2)
+            remaining = f.tell()
+        else:
+            offset = 0
+            remaining = None
 
         leftover = None
         if self.runEntries and (not channels or
@@ -329,8 +361,12 @@ class LogFile:
         chunks = []
         p = LogFileScanner(chunks.append, channels)
         f.seek(offset)
-        data = f.read(min(remaining, self.BUFFERSIZE))
-        remaining -= len(data)
+        if remaining is not None:
+            data = f.read(min(remaining, self.BUFFERSIZE))
+            remaining -= len(data)
+        else:
+            data = f.read(self.BUFFERSIZE)
+
         offset = f.tell()
         while data:
             p.dataReceived(data)
@@ -341,8 +377,11 @@ class LogFile:
                 else:
                     yield (channel, text)
             f.seek(offset)
-            data = f.read(min(remaining, self.BUFFERSIZE))
-            remaining -= len(data)
+            if remaining is not None:
+                data = f.read(min(remaining, self.BUFFERSIZE))
+                remaining -= len(data)
+            else:
+                data = f.read(self.BUFFERSIZE)
             offset = f.tell()
         del f
 
@@ -404,6 +443,33 @@ class LogFile:
 
     def addEntry(self, channel, text):
         assert not self.finished
+
+        if isinstance(text, unicode):
+            text = text.encode('utf-8')
+        if channel != HEADER:
+            # Truncate the log if it's more than logMaxSize bytes
+            if self.logMaxSize and self.nonHeaderLength > self.logMaxSize:
+                # Add a message about what's going on
+                if not self.maxLengthExceeded:
+                    msg = "\nOutput exceeded %i bytes, remaining output has been truncated\n" % self.logMaxSize
+                    self.addEntry(HEADER, msg)
+                    self.merge()
+                    self.maxLengthExceeded = True
+
+                if self.logMaxTailSize:
+                    # Update the tail buffer
+                    self.tailBuffer.append((channel, text))
+                    self.tailLength += len(text)
+                    while self.tailLength > self.logMaxTailSize:
+                        # Drop some stuff off the beginning of the buffer
+                        c,t = self.tailBuffer.pop(0)
+                        n = len(t)
+                        self.tailLength -= n
+                        assert self.tailLength >= 0
+                return
+
+            self.nonHeaderLength += len(text)
+
         # we only add to .runEntries here. merge() is responsible for adding
         # merged chunks to .entries
         if self.runEntries and channel != self.runEntries[0][0]:
@@ -425,15 +491,24 @@ class LogFile:
         self.addEntry(HEADER, text)
 
     def finish(self):
-        self.merge()
+        if self.tailBuffer:
+            msg = "\nFinal %i bytes follow below:\n" % self.tailLength
+            tmp = self.runEntries
+            self.runEntries = [(HEADER, msg)]
+            self.merge()
+            self.runEntries = self.tailBuffer
+            self.merge()
+            self.runEntries = tmp
+            self.merge()
+            self.tailBuffer = []
+        else:
+            self.merge()
+
         if self.openfile:
             # we don't do an explicit close, because there might be readers
             # shareing the filehandle. As soon as they stop reading, the
-            # filehandle will be released and automatically closed. We will
-            # do a sync, however, to make sure the log gets saved in case of
-            # a crash.
+            # filehandle will be released and automatically closed.
             self.openfile.flush()
-            os.fsync(self.openfile.fileno())
             del self.openfile
         self.finished = True
         watchers = self.finishedWatchers
@@ -444,7 +519,15 @@ class LogFile:
 
 
     def compressLog(self):
-        compressed = self.getFilename() + ".bz2.tmp"
+        # bail out if there's no compression support
+        if self.compressMethod == "bz2":
+            if BZ2File is None:
+                return
+            compressed = self.getFilename() + ".bz2.tmp"
+        elif self.compressMethod == "gz":
+            if GzipFile is None:
+                return
+            compressed = self.getFilename() + ".gz.tmp"
         d = threads.deferToThread(self._compressLog, compressed)
         d.addCallback(self._renameCompressedLog, compressed)
         d.addErrback(self._cleanupFailedCompress, compressed)
@@ -452,7 +535,10 @@ class LogFile:
 
     def _compressLog(self, compressed):
         infile = self.getFile()
-        cf = BZ2File(compressed, 'w')
+        if self.compressMethod == "bz2":
+            cf = BZ2File(compressed, 'w')
+        elif self.compressMethod == "gz":
+            cf = GzipFile(compressed, 'w')
         bufsize = 1024*1024
         while True:
             buf = infile.read(bufsize)
@@ -461,7 +547,10 @@ class LogFile:
                 break
         cf.close()
     def _renameCompressedLog(self, rv, compressed):
-        filename = self.getFilename() + '.bz2'
+        if self.compressMethod == "bz2":
+            filename = self.getFilename() + '.bz2'
+        else:
+            filename = self.getFilename() + '.gz'
         if sys.platform == 'win32':
             # windows cannot rename a file on top of an existing one, so
             # fall back to delete-first. There are ways this can fail and
@@ -777,7 +866,7 @@ class BuildStepStatus(styles.Versioned):
         return self.urls.copy()
 
     def isStarted(self):
-	return (self.started is not None)
+        return (self.started is not None)
 
     def isFinished(self):
         return (self.finished is not None)
@@ -885,6 +974,9 @@ class BuildStepStatus(styles.Versioned):
         assert self.started # addLog before stepStarted won't notify watchers
         logfilename = self.build.generateLogfileName(self.name, name)
         log = LogFile(self, name, logfilename)
+        log.logMaxSize = self.build.builder.logMaxSize
+        log.logMaxTailSize = self.build.builder.logMaxTailSize
+        log.compressMethod = self.build.builder.logCompressionMethod
         self.logs.append(log)
         for w in self.watchers:
             receiver = w.logStarted(self.build, self, log)
@@ -943,7 +1035,9 @@ class BuildStepStatus(styles.Versioned):
             if logCompressionLimit is not False and \
                     isinstance(loog, LogFile):
                 if os.path.getsize(loog.getFilename()) > logCompressionLimit:
-                    cld.append(loog.compressLog())
+                    loog_deferred = loog.compressLog()
+                    if loog_deferred:
+                        cld.append(loog_deferred)
 
         for r in self.updates.keys():
             if self.updates[r] is not None:
@@ -1454,6 +1548,9 @@ class BuilderStatus(styles.Versioned):
         self.buildCache = weakref.WeakValueDictionary()
         self.buildCache_LRU = []
         self.logCompressionLimit = False # default to no compression for tests
+        self.logCompressionMethod = "bz2"
+        self.logMaxSize = None # No default limit
+        self.logMaxTailSize = None # No tail buffering
 
     # persistence
 
@@ -1490,6 +1587,18 @@ class BuilderStatus(styles.Versioned):
         # self.basedir must be filled in by our parent
         # self.status must be filled in by our parent
 
+    def reconfigFromBuildmaster(self, buildmaster):
+        # Note that we do not hang onto the buildmaster, since this object
+        # gets pickled and unpickled.
+        if buildmaster.buildCacheSize:
+            self.buildCacheSize = buildmaster.buildCacheSize
+        if buildmaster.eventHorizon:
+            self.eventHorizon = buildmaster.eventHorizon
+        if buildmaster.logHorizon:
+            self.logHorizon = buildmaster.logHorizon
+        if buildmaster.buildHorizon:
+            self.buildHorizon = buildmaster.buildHorizon
+
     def upgradeToVersion1(self):
         if hasattr(self, 'slavename'):
             self.slavenames = [self.slavename]
@@ -1513,6 +1622,16 @@ class BuilderStatus(styles.Versioned):
 
     def setLogCompressionLimit(self, lowerLimit):
         self.logCompressionLimit = lowerLimit
+
+    def setLogCompressionMethod(self, method):
+        assert method in ("bz2", "gz")
+        self.logCompressionMethod = method
+
+    def setLogMaxSize(self, upperLimit):
+        self.logMaxSize = upperLimit
+
+    def setLogMaxTailSize(self, tailSize):
+        self.logMaxTailSize = tailSize
 
     def saveYourself(self):
         for b in self.currentBuilds:
@@ -1600,6 +1719,10 @@ class BuilderStatus(styles.Versioned):
         # skim the directory and delete anything that shouldn't be there anymore
         build_re = re.compile(r"^([0-9]+)$")
         build_log_re = re.compile(r"^([0-9]+)-.*$")
+        # if the directory doesn't exist, bail out here
+        if not os.path.exists(self.basedir):
+            return
+
         for filename in os.listdir(self.basedir):
             num = None
             mo = build_re.match(filename)
@@ -1642,6 +1765,9 @@ class BuilderStatus(styles.Versioned):
         if not (b and b.isFinished()):
             b = self.getBuild(-2)
         return b
+
+    def getCategory(self):
+        return self.category
 
     def getBuild(self, number):
         if number < 0:
@@ -1692,7 +1818,7 @@ class BuilderStatus(styles.Versioned):
                 if got >= num_builds:
                     return
 
-    def eventGenerator(self, branches=[]):
+    def eventGenerator(self, branches=[], categories=[]):
         """This function creates a generator which will provide all of this
         Builder's status events, starting with the most recent and
         progressing backwards in time. """
@@ -1711,8 +1837,15 @@ class BuilderStatus(styles.Versioned):
         for Nb in range(1, self.nextBuildNumber+1):
             b = self.getBuild(-Nb)
             if not b:
+                # HACK: If this is the first build we are looking at, it is
+                # possible it's in progress but locked before it has written a
+                # pickle; in this case keep looking.
+                if Nb == 1:
+                    continue
                 break
             if branches and not b.getSourceStamp().branch in branches:
+                continue
+            if categories and not b.getBuilder().getCategory() in categories:
                 continue
             steps = b.getSteps()
             for Ns in range(1, len(steps)+1):
@@ -1800,8 +1933,11 @@ class BuilderStatus(styles.Versioned):
         for w in self.watchers:
             w.requestSubmitted(brstatus)
 
-    def removeBuildRequest(self, brstatus):
+    def removeBuildRequest(self, brstatus, cancelled=False):
         self.pendingBuilds.remove(brstatus)
+        if cancelled:
+            for w in self.watchers:
+                w.requestCancelled(self, brstatus)
 
     # buildStarted is called by our child BuildStatus instances
     def buildStarted(self, s):
@@ -1932,6 +2068,8 @@ class SlaveStatus:
 
     admin = None
     host = None
+    access_uri = None
+    version = None
     connected = False
     graceful_shutdown = False
 
@@ -1947,6 +2085,10 @@ class SlaveStatus:
         return self.admin
     def getHost(self):
         return self.host
+    def getAccessURI(self):
+        return self.access_uri
+    def getVersion(self):
+        return self.version
     def isConnected(self):
         return self.connected
     def lastMessageReceived(self):
@@ -1958,6 +2100,10 @@ class SlaveStatus:
         self.admin = admin
     def setHost(self, host):
         self.host = host
+    def setAccessURI(self, access_uri):
+        self.access_uri = access_uri
+    def setVersion(self, version):
+        self.version = version
     def setConnected(self, isConnected):
         self.connected = isConnected
     def setLastMessageReceived(self, when):
@@ -2014,6 +2160,10 @@ class Status:
         assert os.path.isdir(basedir)
         # compress logs bigger than 4k, a good default on linux
         self.logCompressionLimit = 4*1024
+        self.logCompressionMethod = "bz2"
+        # No default limit to the log size
+        self.logMaxSize = None
+        self.logMaxTailSize = None
 
 
     # methods called by our clients
@@ -2077,11 +2227,11 @@ class Status:
                     break
             else:
                 return None
-            return prefix + "builders/%s/builds/%d/steps/%s/logs/%d" % (
+            return prefix + "builders/%s/builds/%d/steps/%s/logs/%s" % (
                 urllib.quote(builder.getName(), safe=''),
                 build.getNumber(),
                 urllib.quote(step.getName(), safe=''),
-                lognum)
+                urllib.quote(log.getName()))
 
     def getChangeSources(self):
         return list(self.botmaster.parent.change_svc)
@@ -2227,6 +2377,9 @@ class Status:
 
         builder_status.setBigState("offline")
         builder_status.setLogCompressionLimit(self.logCompressionLimit)
+        builder_status.setLogCompressionMethod(self.logCompressionMethod)
+        builder_status.setLogMaxSize(self.logMaxSize)
+        builder_status.setLogMaxTailSize(self.logMaxTailSize)
 
         for t in self.watchers:
             self.announceNewBuilder(t, name, builder_status)

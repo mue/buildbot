@@ -5,11 +5,9 @@ Tested with Python boto 1.5c
 
 # Portions copyright Canonical Ltd. 2009
 
-import cStringIO
 import os
 import re
 import time
-import urllib
 
 import boto
 import boto.exception
@@ -32,7 +30,7 @@ class EC2LatentBuildSlave(AbstractLatentBuildSlave):
     def __init__(self, name, password, instance_type, ami=None,
                  valid_ami_owners=None, valid_ami_location_regex=None,
                  elastic_ip=None, identifier=None, secret_identifier=None,
-                 aws_id_file_path=None,
+                 aws_id_file_path=None, user_data=None,
                  keypair_name='latent_buildbot_slave',
                  security_name='latent_buildbot_slave',
                  max_builds=None, notify_on_missing=[], missing_timeout=60*20,
@@ -68,6 +66,7 @@ class EC2LatentBuildSlave(AbstractLatentBuildSlave):
         self.instance_type = instance_type
         self.keypair_name = keypair_name
         self.security_name = security_name
+        self.user_data = user_data
         if identifier is None:
             assert secret_identifier is None, (
                 'supply both or neither of identifier, secret_identifier')
@@ -87,11 +86,11 @@ class EC2LatentBuildSlave(AbstractLatentBuildSlave):
             finally:
                 aws_file.close()
         else:
-            assert (aws_id_file_path is None,
-                    'if you supply the identifier and secret_identifier, '
-                    'do not specify the aws_id_file_path')
-            assert (secret_identifier is not None,
-                    'supply both or neither of identifier, secret_identifier')
+            assert aws_id_file_path is None, \
+                    'if you supply the identifier and secret_identifier, ' \
+                    'do not specify the aws_id_file_path'
+            assert secret_identifier is not None, \
+                    'supply both or neither of identifier, secret_identifier'
         # Make the EC2 connection.
         self.conn = boto.connect_ec2(identifier, secret_identifier)
 
@@ -186,8 +185,8 @@ class EC2LatentBuildSlave(AbstractLatentBuildSlave):
         options.sort()
         log.msg('sorted images (last is chosen): %s' %
                 (', '.join(
-                    '%s (%s)' % (candidate[-1].id, candidate[-1].location)
-                    for candidate in options)))
+                    ['%s (%s)' % (candidate[-1].id, candidate[-1].location)
+                    for candidate in options])))
         if not options:
             raise ValueError('no available images match constraints')
         return options[-1][-1]
@@ -207,7 +206,7 @@ class EC2LatentBuildSlave(AbstractLatentBuildSlave):
         image = self.get_image()
         reservation = image.run(
             key_name=self.keypair_name, security_groups=[self.security_name],
-            instance_type=self.instance_type)
+            instance_type=self.instance_type, user_data=self.user_data)
         self.instance = reservation.instances[0]
         log.msg('%s %s starting instance %s' %
                 (self.__class__.__name__, self.slavename, self.instance.id))

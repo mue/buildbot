@@ -1,0 +1,21 @@
+{%- macro page_header(title, path_to_root, texturl) -%}
+  <html>
+  <head><title>{{ title }}</title>
+  <link rel="stylesheet" href="{{ path_to_root }}default.css" type="text/css" />
+  </head>
+  <body class='log'>
+    <a href="{{ texturl }}">(view as text)</a><br/>
+    <pre>  
+{%- endmacro -%}
+
+{%- macro chunks(entries) -%}
+{%- for entry in entries -%}
+      <span class="{{ entry.type }}">{{ entry.text|e }}</span>
+{% endfor -%}
+{%- endmacro -%}
+
+{%- macro page_footer() -%}
+</pre>
+</body>
+</html>
+{%- endmacro -%}

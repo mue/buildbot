@@ -75,7 +75,7 @@ class HTPasswdAuth(AuthBase):
         # This is the DES-hash of the password. The first two characters are
         # the salt used to introduce disorder in the DES algorithm.
         hash = lines[0][1]
-        from crypt import crypt
+        from crypt import crypt #@UnresolvedImport
         res = hash == crypt(passwd, hash[0:2])
         if res:
             self.err = ""
@@ -86,10 +86,7 @@ class HTPasswdAuth(AuthBase):
 class AuthFailResource(HtmlResource):
     title = "Authentication Failed"
 
-    def body(self, request):
-        data = ''
-        data += '<h1>Authentication Failed</h1>\n'
-        data += '<p>The username or password you entered were not correct.  Please go back and try again.</p>\n'
-
-        return data
-
+    def content(self, request, cxt):
+        template = request.site.buildbot_service.templates.get_template("authfail.html")
+        return template.render(**cxt)
+    

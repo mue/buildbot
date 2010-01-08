@@ -1,10 +1,8 @@
-from twisted.internet import defer, reactor
 from twisted.trial import unittest
 
 from buildbot.sourcestamp import SourceStamp
 from buildbot.process.base import BuildRequest
 from buildbot.process.properties import Properties
-from buildbot.status import builder, base, words
 from buildbot.changes.changes import Change
 
 from buildbot.test.runutils import RunMixin
@@ -16,6 +14,7 @@ from buildbot.test.runutils import RunMixin
 master_cfg = """from buildbot.process import factory
 from buildbot.steps import dummy
 from buildbot.buildslave import BuildSlave
+from buildbot.config import BuilderConfig
 
 f = factory.BuildFactory([
    dummy.Dummy(timeout=0),
@@ -24,9 +23,9 @@ f = factory.BuildFactory([
 BuildmasterConfig = c = {}
 c['slaves'] = [BuildSlave('bot1', 'sekrit')]
 c['schedulers'] = []
-c['builders'] = []
-c['builders'].append({'name':'dummy', 'slavename':'bot1',
-                      'builddir': 'dummy', 'factory': f})
+c['builders'] = [
+    BuilderConfig(name='dummy', slavename='bot1', factory=f),
+]
 c['slavePortnum'] = 0
 
 %s
