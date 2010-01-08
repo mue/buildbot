@@ -440,7 +440,7 @@ class SVNPoller(base.ChangeSource, util.ComparableMixin):
                                comments=comments,
                                revision=revision,
                                branch=branch,
-			       repository=self.svnurl)
+                               repository=self.svnurl)
                     changes.append(c)
 
         return changes

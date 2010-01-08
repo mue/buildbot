@@ -304,11 +304,11 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(len(changes), 2)
         self.failUnlessEqual(changes[0].branch, "branch")
         self.failUnlessEqual(changes[0].revision, '2')
-	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
+        self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
         self.failUnlessEqual(changes[1].branch, "branch")
         self.failUnlessEqual(changes[1].files, ["main.c"])
         self.failUnlessEqual(changes[1].revision, '3')
-	self.failUnlessEqual(changes[1].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
+        self.failUnlessEqual(changes[1].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
         # and now pull in r4
         doc = s.parse_logs(make_changes_output(4))
@@ -320,7 +320,7 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(changes[0].branch, None)
         self.failUnlessEqual(changes[0].revision, '4')
         self.failUnlessEqual(changes[0].files, ["version.c"])
-	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
+        self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
         # and now pull in r5 (should *not* create a change as it's a
         # branch deletion
@@ -342,7 +342,7 @@ class ComputeChanges(unittest.TestCase):
         self.failUnlessEqual(changes[0].branch, 'branch')
         self.failUnlessEqual(changes[0].revision, '6')
         self.failUnlessEqual(changes[0].files, ["version.c"])
-	self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
+        self.failUnlessEqual(changes[0].repository, "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample")
 
     def testFirstTime(self):
         base = "file:///home/warner/stuff/Projects/BuildBot/trees/svnpoller/_trial_temp/test_vc/repositories/SVN-Repository/sample"

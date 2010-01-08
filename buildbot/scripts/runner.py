@@ -716,7 +716,7 @@ class SendChangeOptions(usage.Options):
         ("master", "m", None,
          "Location of the buildmaster's PBListener (host:port)"),
         ("username", "u", None, "Username performing the commit"),
-	("repository", "p", None, "Repository specifier"),
+        ("repository", "p", None, "Repository specifier"),
         ("branch", "b", None, "Branch specifier"),
         ("category", "c", None, "Category of repository"),
         ("revision", "r", None, "Revision specifier (string)"),
@@ -772,7 +772,7 @@ def sendchange(config, runReactor=False):
 
     s = Sender(master, user)
     d = s.send(branch, revision, comments, files, category=category,
-	       when=when, repository=repository)
+               when=when, repository=repository)
     if runReactor:
         d.addCallbacks(s.printSuccess, s.printFailure)
         d.addBoth(s.stop)

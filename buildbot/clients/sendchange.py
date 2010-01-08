@@ -11,7 +11,7 @@ class Sender:
         self.num_changes = 0
 
     def send(self, branch, revision, comments, files, user=None,
-	     category=None, when=None, repository=None):
+             category=None, when=None, repository=None):
         if user is None:
             user = self.user
 	change = {'who': user, 'files': files, 'comments': comments,
